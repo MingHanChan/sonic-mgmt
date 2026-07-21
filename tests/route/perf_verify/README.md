@@ -42,8 +42,10 @@ Use the pytest test for CI/regression; use this for the deployment A/B write-up.
 tests/route/perf_verify/
 ├── README.md                     # this runbook
 └── scripts/
-    ├── run_perf.sh               # orchestrator: inject N routes, wait, read T, N iters, mean±std
+    ├── run_perf.sh               # T1 orchestrator: inject N routes (APPL_DB), wait, read T, N iters, mean±std
     ├── inject_routes.py          # APPL_DB ROUTE_TABLE producer (Redis-path micro-benchmark)
+    ├── run_t2_bgp.sh             # T2 orchestrator: mark, (ssh) trigger BGP peer, idle-wait, read T
+    ├── gen_frr_routes.py         # generate FRR/vtysh static-route add/del batch for the BGP peer
     ├── measure_route_time.py     # parse sairedis.rec -> T (count, ms, rate)
     └── profile_orchagent.sh      # perf profile of orchagent to validate change #2
 ```
@@ -126,8 +128,57 @@ i.e. a real BGP feed. This is also the truest end-to-end measurement.
    config save -y && config reload -y      # or: systemctl restart swss bgp
    ```
 
-2. Advertise a fixed route set from a peer. With **exabgp** on the test host /
-   a neighbor container:
+Then advertise a fixed route set from the peer. Two options depending on what
+the peer is: **method A (FRR/vtysh)** when the peer is a SONiC/FRR box (the usual
+air-gapped SONiC-to-SONiC lab), or **method B (exabgp/gobgp)** when the peer is a
+generic Linux host.
+
+### Method A -- peer is a SONiC/FRR box (recommended for a SONiC-to-SONiC lab)
+
+No package install needed: the peer's FRR already speaks BGP and the session to
+the DUT is already up. Originate a batch of static routes and let FRR
+redistribute them into BGP.
+
+1. One-time, on the peer, enable static redistribution:
+
+   ```bash
+   frr-vtysh -c "configure terminal" \
+             -c "router bgp <PEER_AS>" \
+             -c "address-family ipv4 unicast" \
+             -c "redistribute static"
+   ```
+
+2. Generate the add/withdraw batches (same route set as T1, on the peer):
+
+   ```bash
+   ./scripts/gen_frr_routes.py add --count 100000 --base 10.0.0.0 > /tmp/routes_add.conf
+   ./scripts/gen_frr_routes.py del --count 100000 --base 10.0.0.0 > /tmp/routes_del.conf
+   ```
+
+3. Drive the run from the DUT with the T2 orchestrator (marks time, waits for the
+   ASIC count to go idle, reads T). It can trigger the peer over ssh, or prompt
+   you to run `frr-vtysh` manually:
+
+   ```bash
+   # auto-trigger (script ssh-es the peer):
+   ./scripts/run_t2_bgp.sh --expect 100000 --peer admin@192.168.1.1 --add-file /tmp/routes_add.conf
+   # or manual (it prompts, you run 'frr-vtysh < /tmp/routes_add.conf' on the peer):
+   ./scripts/run_t2_bgp.sh --expect 100000
+   ```
+
+   > Feed the batch with `frr-vtysh < file` (stdin), NOT `vtysh -f <hostpath>`:
+   > `frr-vtysh` execs into the `bgp` container, which has its own filesystem and
+   > cannot see a path on the host. Withdraw with
+   > `frr-vtysh < /tmp/routes_del.conf` between iterations.
+
+`run_t2_bgp.sh` detects completion with an idle timer (waits as long as the count
+keeps advancing, so a programming run longer than any fixed timeout is fine) and
+prints T. Then compare against T1 -- see "Compare T2 vs T1" below.
+
+### Method B -- peer is a generic Linux host (exabgp / gobgp)
+
+Advertise the same route set with **exabgp** on the test host / a neighbor
+container:
 
    ```
    # exabgp.conf (announce 100k /32 from a single peer)
@@ -148,7 +199,9 @@ i.e. a real BGP feed. This is also the truest end-to-end measurement.
    (gobgp works equally well: `gobgp global rib add` in a loop, or a MRT
    injection.) Keep the exact same route set for B/T1/T2 so T is comparable.
 
-3. Time it the same way — the ASIC window is still in sairedis.rec:
+Time it the same way — the ASIC window is still in sairedis.rec. You can reuse
+the T2 orchestrator (its idle-wait + T read are transport agnostic; just trigger
+exabgp/gobgp when it prompts), or do it by hand:
 
    ```bash
    MARK=$(date +"%Y-%m-%d.%H:%M:%S"); sleep 1
@@ -157,12 +210,14 @@ i.e. a real BGP feed. This is also the truest end-to-end measurement.
    ./scripts/measure_route_time.py /var/log/swss/sairedis.rec --since "$MARK"
    ```
 
-4. Compare `T_T2` against `T_T1`. The ZMQ win shows up as lower T **and** lower
-   `redis-server` CPU during the burst:
+### Compare T2 vs T1 (both methods)
 
-   ```bash
-   pidstat -p "$(pidof redis-server)" 1      # sample during the announcement
-   ```
+Compare `T_T2` against `T_T1`. The ZMQ win shows up as lower T **and** lower
+`redis-server` CPU during the burst:
+
+```bash
+pidstat -p "$(pidof redis-server)" 1      # sample during the announcement
+```
 
 ---
 
