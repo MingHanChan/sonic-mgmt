@@ -10,11 +10,20 @@ from the three orchagent efficiency changes:
 The headline metric **T** = the ASIC route-programming window: time from the
 first to the last route `create` in `/var/log/swss/sairedis.rec`. sairedis.rec
 is still enabled by default (`record_type=1`) after change #1, so this timing
-source is always present.
+source is always present. The same window measured over `remove` ops is the
+**withdraw window** — route removal speed matters just as much during failure
+convergence, so the orchestrators measure both.
 
 ```
 improvement% = (T_baseline - T_treatment) / T_baseline * 100
 ```
+
+> **What T does and does not cover.** sairedis.rec and the ASIC_DB key count
+> are both written by the sairedis client library *inside orchagent*, i.e. they
+> mark the orchagent egress boundary — syncd consumption and SDK/hardware
+> programming happen after. For A/B comparison of these three changes that is
+> the right boundary; for absolute end-to-end claims, cross-check with
+> `hw_route_watch.sh` (below) that syncd kept up.
 
 ## Relationship to `tests/route/test_route_perf.py`
 
@@ -30,6 +39,8 @@ does not cover for verifying these three specific changes:
   (`orch_northbond_route_zmq_enabled`) so you can attribute the gain.
 - **Finer timing** from `sairedis.rec` (microsecond create timestamps) instead
   of ~1 s count-polling granularity.
+- **Bottleneck attribution** — per-process/per-core CPU sampling during the
+  burst tells you *which* stage the run was limited by.
 - **`perf` profiling** of orchagent to see the NextHopGroupTable map->hash win.
 - **DUT-direct** — runs over SSH with no ptf/minigraph/testbed, so you can spot
   check on any lab unit.
@@ -42,24 +53,32 @@ Use the pytest test for CI/regression; use this for the deployment A/B write-up.
 tests/route/perf_verify/
 ├── README.md                     # this runbook
 └── scripts/
-    ├── run_perf.sh               # T1 orchestrator: inject N routes (APPL_DB), wait, read T, N iters, mean±std
-    ├── inject_routes.py          # APPL_DB ROUTE_TABLE producer (Redis-path micro-benchmark)
-    ├── run_t2_bgp.sh             # T2 orchestrator: mark, (ssh) trigger BGP peer, idle-wait, read T
+    ├── run_perf.sh               # Redis-path orchestrator: inject N routes (swssconfig), read add+del T, N iters, mean±std
+    ├── inject_routes.py          # APPL_DB ROUTE_TABLE producer (swssconfig default; python/redis fallback)
+    ├── run_t2_bgp.sh             # BGP-feed orchestrator (T1b: zmq off / T2: zmq on): mark, trigger peer, idle-wait, add+del T
     ├── gen_frr_routes.py         # generate FRR/vtysh static-route add/del batch for the BGP peer
-    ├── measure_route_time.py     # parse sairedis.rec -> T (count, ms, rate)
+    ├── measure_route_time.py     # parse sairedis.rec -> T (count, ms, rate; --op create|remove)
+    ├── sample_proc_cpu.py        # /proc CPU sampler + env snapshot + bottleneck summary (--stats integration)
+    ├── hw_route_watch.sh         # Broadcom cross-check: ASIC_DB vs bcmcmd completion lag
     └── profile_orchagent.sh      # perf profile of orchagent to validate change #2
 ```
 
-All scripts run **on the DUT** (they need `swsscommon`, `sonic-db-cli`, and for
-profiling `perf`). Copy the `scripts/` dir to the DUT, or run from the
-`sonic-mgmt` container over SSH.
+All scripts run **on the DUT** (they need `sonic-db-cli`, docker access to the
+`swss` container, and for profiling `perf`). Copy the `scripts/` dir to the
+DUT, or run from the `sonic-mgmt` container over SSH.
 
 ## Prerequisites
 
 - Two SONiC images on hand: **baseline** (unmodified `QUANTA_202211`) and
   **treatment** (with the three changes + the swss-common ZMQ backport).
-- A quiet DUT (no BGP flaps / heavy counter polling during a run).
-- `perf` on the DUT for change #2 profiling (`linux-tools` / `linux-perf`).
+- A quiet DUT — concretely: no BGP flaps, flex counters off for the run
+  (`counterpoll show`, disable what is enabled), CRM polling left at/above the
+  default 300 s (`crm config polling interval`). The `--stats` env snapshot
+  records all of this per run so results stay auditable.
+- `perf` on the DUT for change #2 profiling (`linux-tools` / `linux-perf`),
+  **and debug symbols for orchagent** — a production image is stripped; use an
+  image built with `INSTALL_DEBUG_TOOLS=y` or install the matching `swss-dbg` /
+  `libsairedis-dbg` debs, or the report is unreadable addresses.
 - Pick a route scale that matches your production table (e.g. 100k /32, and an
   ECMP variant since NextHopGroupTable benefits scale with the number/size of
   next-hop groups).
@@ -68,37 +87,52 @@ profiling `perf`). Copy the `scripts/` dir to the DUT, or run from the
 
 Run the SAME workload in each row, on the SAME DUT hardware:
 
-| Row | Image | swss.rec | route ZMQ | Isolates |
-|-----|-------|----------|-----------|----------|
-| **B**  | baseline  | on (`-r 3`)  | n/a       | reference `T_base` |
-| **T1** | treatment | off (`-r 1`) | disable   | change #1 + #2 (Redis path) |
-| **T2** | treatment | off (`-r 1`) | enable    | adds change #3 (ZMQ path) |
+| Row | Image | swss.rec | route ZMQ | Feed | Isolates |
+|-----|-------|----------|-----------|------|----------|
+| **B**   | baseline  | on (`-r 3`)  | n/a     | swssconfig | reference `T_B` |
+| **T1**  | treatment | off (`-r 1`) | disable | swssconfig | change #1 + #2 (Redis path) |
+| **T1b** | treatment | off (`-r 1`) | disable | BGP peer   | reference for #3 |
+| **T2**  | treatment | off (`-r 1`) | enable  | BGP peer   | adds change #3 (ZMQ path) |
 
-- change #1 + #2 improvement = `(T_B  - T_T1) / T_B  * 100`
-- change #3 (incremental)     = `(T_T1 - T_T2) / T_T1 * 100`
-- total                       = `(T_B  - T_T2) / T_B  * 100`
+- change #1 + #2 improvement = `(T_B   - T_T1) / T_B   * 100`
+- change #3 (incremental)     = `(T_T1b - T_T2) / T_T1b * 100`
+
+**Do not** compute #3 as T1 vs T2: those two rows use different feeds
+(swssconfig skips zebra/fpmsyncd entirely), so their T values are not
+comparable. T1b exists precisely so the #3 comparison holds the feed, the
+route set and the pipeline length constant, flipping only the ZMQ flag.
+For a single end-to-end headline number, optionally run **B-bgp** (baseline
+image, BGP feed) and quote `(T_B-bgp - T_T2) / T_B-bgp * 100`.
 
 > To split #1 from #2 exactly you'd need an extra build with only one of them,
 > or read #2 straight off the perf profile (see "Validating change #2").
 
 ---
 
-## Scenario B / T1 — Redis-path micro-benchmark (reproducible)
+## Rows B / T1 — Redis-path benchmark (swssconfig feed)
 
-Uses `inject_routes.py`, which pushes routes into APPL_DB `ROUTE_TABLE` via the
-`ProducerStateTable` protocol — exactly what orchagent consumes on the classic
-Redis path. This isolates the orchagent-internal changes (#1, #2).
+Uses `inject_routes.py`, which by default generates a swssconfig JSON batch and
+runs `swssconfig` inside the swss container — the same C++ buffered-pipeline
+channel `tests/route/test_route_perf.py` uses. This isolates the
+orchagent-internal changes (#1, #2).
+
+> **Why swssconfig and not a python producer:** the injector must be faster
+> than orchagent's consumption or T measures the injector. `run_perf.sh`
+> enforces this: any iteration whose produce-side time exceeds **T/3** is
+> discarded as producer-bound. The `--via redis` fallback (python
+> ProducerStateTable, buffered when the bindings allow) exists for setups
+> where docker exec is unavailable — watch the produce times it prints.
 
 On the DUT:
 
 ```bash
 cd scripts
 
-# make sure route ZMQ is OFF for B and T1
-sonic-db-cli CONFIG_DB hget "DEVICE_METADATA|localhost" "orch_northbond_route_zmq_enabled"   # expect empty/false
+# run_perf.sh aborts if the route-ZMQ flag is on (orchagent would not consume
+# APPL_DB ROUTE_TABLE) -- no manual flag check needed.
 
-# 100k single-nexthop routes, 6 iterations (first discarded)
-./run_perf.sh --count 100000 --nexthop 192.168.1.1@Ethernet0 --iters 6
+# 100k single-nexthop routes, 6 iterations (first discarded), with CPU sampling
+./run_perf.sh --count 100000 --nexthop 192.168.1.1@Ethernet0 --iters 6 --stats /tmp/perfstats_t1
 
 # ECMP variant (stresses NextHopGroupTable the most)
 ./run_perf.sh --count 50000 \
@@ -106,25 +140,27 @@ sonic-db-cli CONFIG_DB hget "DEVICE_METADATA|localhost" "orch_northbond_route_zm
     --iters 6
 ```
 
-`run_perf.sh` prints per-iteration T and a `T mean ± stddev` summary. Record the
-mean for **B** (baseline image) and **T1** (treatment image, ZMQ off).
+`run_perf.sh` prints per-iteration add/del T and a `T mean ± stddev` summary
+for both windows. Record the means for **B** (baseline image) and **T1**
+(treatment image, ZMQ off).
 
 > Pick `--nexthop` IPs that resolve to real neighbors on your DUT (so the routes
 > actually program to hardware). `ip neigh` / the interfaces in your config.
 
 ---
 
-## Scenario T2 — end-to-end ZMQ path (real BGP)
+## Rows T1b / T2 — end-to-end BGP feed
 
 With `orch_northbond_route_zmq_enabled=true`, orchagent's route consumer is a
 `ZmqConsumerStateTable`; it no longer reads APPL_DB `ROUTE_TABLE`, so
 `inject_routes.py` will NOT reach it. Routes must arrive through **fpmsyncd**,
-i.e. a real BGP feed. This is also the truest end-to-end measurement.
+i.e. a real BGP feed. Run the SAME BGP workload twice — once with the flag off
+(**T1b**) and once with it on (**T2**); that pair isolates change #3.
 
-1. Enable the feature (uses the new CLI from sonic-utilities):
+1. Set the flag for the row (uses the new CLI from sonic-utilities):
 
    ```bash
-   config route-zmq enable
+   config route-zmq disable        # T1b row      (enable for the T2 row)
    config save -y && config reload -y      # or: systemctl restart swss bgp
    ```
 
@@ -148,32 +184,44 @@ redistribute them into BGP.
              -c "redistribute static"
    ```
 
-2. Generate the add/withdraw batches (same route set as T1, on the peer):
+2. Generate the add/withdraw batches (same route set as B/T1, on the peer):
 
    ```bash
    ./scripts/gen_frr_routes.py add --count 100000 --base 10.0.0.0 > /tmp/routes_add.conf
    ./scripts/gen_frr_routes.py del --count 100000 --base 10.0.0.0 > /tmp/routes_del.conf
    ```
 
-3. Drive the run from the DUT with the T2 orchestrator (marks time, waits for the
-   ASIC count to go idle, reads T). It can trigger the peer over ssh, or prompt
-   you to run `frr-vtysh` manually:
+3. Drive the run from the DUT with the BGP orchestrator (marks time, waits for
+   the ASIC count to go idle, reads add T, then withdraw T). `--require-zmq`
+   pins which row you are measuring — it aborts on a flag mismatch, and every
+   result line is labeled with the flag state, so T1b and T2 numbers cannot be
+   mixed up. It can trigger the peer over ssh, or prompt you to run `frr-vtysh`
+   manually:
 
    ```bash
-   # auto-trigger (script ssh-es the peer):
-   ./scripts/run_t2_bgp.sh --expect 100000 --peer admin@192.168.1.1 --add-file /tmp/routes_add.conf
-   # or manual (it prompts, you run 'frr-vtysh < /tmp/routes_add.conf' on the peer):
-   ./scripts/run_t2_bgp.sh --expect 100000
+   # T1b row, auto-trigger (script ssh-es the peer, measures add + withdraw):
+   ./scripts/run_t2_bgp.sh --expect 100000 --require-zmq false \
+       --peer admin@192.168.1.1 --add-file /tmp/routes_add.conf \
+       --del-file /tmp/routes_del.conf --stats /tmp/perfstats_t1b
+
+   # T2 row, same command with the flag flipped on the DUT first:
+   ./scripts/run_t2_bgp.sh --expect 100000 --require-zmq true \
+       --peer admin@192.168.1.1 --add-file /tmp/routes_add.conf \
+       --del-file /tmp/routes_del.conf --stats /tmp/perfstats_t2
+
+   # or manual (it prompts; run 'frr-vtysh < /tmp/routes_add.conf' on the peer):
+   ./scripts/run_t2_bgp.sh --expect 100000 --require-zmq true --measure-del
    ```
 
    > Feed the batch with `frr-vtysh < file` (stdin), NOT `vtysh -f <hostpath>`:
    > `frr-vtysh` execs into the `bgp` container, which has its own filesystem and
-   > cannot see a path on the host. Withdraw with
-   > `frr-vtysh < /tmp/routes_del.conf` between iterations.
+   > cannot see a path on the host.
 
 `run_t2_bgp.sh` detects completion with an idle timer (waits as long as the count
 keeps advancing, so a programming run longer than any fixed timeout is fine) and
-prints T. Then compare against T1 -- see "Compare T2 vs T1" below.
+prints T for the add and (with `--del-file`/`--measure-del`) the withdraw.
+Repeat a few times and average — the orchestrator is single-shot by design so
+the peer batch stays under your control.
 
 ### Method B -- peer is a generic Linux host (exabgp / gobgp)
 
@@ -197,11 +245,11 @@ container:
    ```
 
    (gobgp works equally well: `gobgp global rib add` in a loop, or a MRT
-   injection.) Keep the exact same route set for B/T1/T2 so T is comparable.
+   injection.) Keep the exact same route set for all rows so T is comparable.
 
 Time it the same way — the ASIC window is still in sairedis.rec. You can reuse
-the T2 orchestrator (its idle-wait + T read are transport agnostic; just trigger
-exabgp/gobgp when it prompts), or do it by hand:
+the BGP orchestrator (its idle-wait + T read are transport agnostic; just
+trigger exabgp/gobgp when it prompts), or do it by hand:
 
    ```bash
    MARK=$(date +"%Y-%m-%d.%H:%M:%S"); sleep 1
@@ -210,14 +258,51 @@ exabgp/gobgp when it prompts), or do it by hand:
    ./scripts/measure_route_time.py /var/log/swss/sairedis.rec --since "$MARK"
    ```
 
-### Compare T2 vs T1 (both methods)
+### Reading T1b vs T2
 
-Compare `T_T2` against `T_T1`. The ZMQ win shows up as lower T **and** lower
-`redis-server` CPU during the burst:
+The ZMQ win shows up as lower T **and** lower `redis-server` CPU during the
+burst — the `--stats` summary shows both signatures side by side. If instead
+`zebra`/`fpmsyncd` saturate a core while `orchagent` idles, the FEED is the
+bottleneck and the row pair cannot resolve change #3 (speed up the feed or
+grow the batch).
+
+---
+
+## CPU sampling & the environment snapshot (`--stats`)
+
+Both orchestrators take `--stats <dir>`; they start `sample_proc_cpu.py`
+alongside the run and print its summary at the end. It samples
+orchagent/syncd/redis-server/fpmsyncd/zebra/bgpd and every core once per
+second from /proc (no sysstat dependency), and snapshots the noise-relevant
+config (route-ZMQ flag, counterpoll, CRM interval, orchagent args, image
+version) into `<dir>/env.txt`.
+
+Interpretation: orchagent's main loop is single-threaded, so **whichever
+process pins one core near 100% during the burst is the bottleneck stage**:
+
+- `orchagent` ≈100% -> orchagent-bound: changes #1/#2 are the lever.
+- `redis-server` high on B/T1/T1b and low on T2 -> the Redis hop removal is real.
+- `zebra`/`fpmsyncd` pinned with orchagent idle-ish -> feed-bound; fix before A/B.
+- nothing pinned -> batch too small, neighbors unresolved, or waits dominate.
+
+Standalone use: `sample_proc_cpu.py record --out DIR` / `summarize --out DIR`.
+
+## Hardware-side cross-check (`hw_route_watch.sh`, Broadcom)
+
+Because sairedis.rec/ASIC_DB mark the orchagent egress, a lagging syncd would
+be invisible to T. Once per scenario (not every iteration), start the watcher
+before the injection:
 
 ```bash
-pidstat -p "$(pidof redis-server)" 1      # sample during the announcement
+./scripts/hw_route_watch.sh --expect 100000 &     # may need --count-cmd 'sudo bcmcmd "l3 defip show"'
+./scripts/run_perf.sh --count 100000 --nexthop 192.168.1.1@Ethernet0 --iters 1
 ```
+
+It polls ASIC_DB and `bcmcmd "l3 defip show"` side by side and reports the lag
+between the two completion times. Small lag (≈ polling granularity) -> the
+sairedis.rec window is a fair proxy for hardware completion; large lag ->
+quote the hardware time. Each bcmcmd at 100k entries can take a few seconds,
+so raise `--interval` at high scale; this is a cross-check, not the headline.
 
 ---
 
@@ -237,31 +322,58 @@ red-black tree comparison path (`std::_Rb_tree...`, `NextHopGroupKey::operator<`
 **treatment** image that collapses into a cheap `std::_Hashtable` / `hash<...>`
 probe. The shrink in that share is change #2's contribution.
 
+**Symbols required**: the script warns when most samples are unresolved
+addresses. That means a stripped production build — use an
+`INSTALL_DEBUG_TOOLS=y` image or install the matching `swss-dbg` /
+`libsairedis-dbg` debs, and use a `perf` that matches the running kernel.
+
 ---
 
 ## Reading the result
 
-For each row, take the `T mean` from `run_perf.sh` (or `measure_route_time.py`
-for the BGP path), then:
+For each row, take the `T mean` from the orchestrator summary, then:
 
 | Quantity | Formula | Example |
 |----------|---------|---------|
-| #1+#2 (Redis) | `(T_B - T_T1)/T_B`   | (5.0s - 4.0s)/5.0s = **20%** |
-| #3 (ZMQ, incr.) | `(T_T1 - T_T2)/T_T1` | (4.0s - 3.4s)/4.0s = **15%** |
-| total | `(T_B - T_T2)/T_B`   | (5.0s - 3.4s)/5.0s = **32%** |
+| #1+#2 (Redis path)   | `(T_B   - T_T1) / T_B`   | (5.0s - 4.0s)/5.0s = **20%** |
+| #3 (ZMQ, incremental) | `(T_T1b - T_T2) / T_T1b` | (4.2s - 3.4s)/4.2s = **19%** |
+| end-to-end (optional B-bgp row) | `(T_B-bgp - T_T2) / T_B-bgp` | — |
 
-Report `mean ± stddev` across the counted iterations, not a single run.
+Report `mean ± stddev` across the counted iterations, not a single run, for
+both the add and the withdraw window, and attach the `--stats` bottleneck
+summary for each row. If stddev exceeds ~5% of the mean, find the noise source
+before comparing rows.
+
+## Parity check (do this once per image pair)
+
+A transport that silently drops events makes T look *better*. Before quoting
+numbers, verify on the treatment image with ZMQ on:
+
+- FRR RIB, APPL_DB `ROUTE_TABLE` (written asynchronously by the producer's
+  AsyncDBUpdater) and ASIC_DB route counts all match the expected set exactly
+  (`run_t2_bgp.sh --expect` already cross-checks the ASIC_DB delta).
+- A warm restart after a ZMQ-path run reconciles cleanly (APPL_DB is the warm
+  restart source, so the async write-back must be complete and correct).
+- orchagent RSS before/after (both changes trade memory for speed):
+  `grep VmRSS /proc/$(pidof orchagent)/status`.
 
 ## Gotchas
 
-- **Warm-up**: `run_perf.sh` already drops iteration 1. Keep it.
-- **Same route set & ECMP distribution** across B/T1/T2 — NextHopGroupTable
+- **Warm-up**: the orchestrators discard iteration 1. Keep it.
+- **Producer-bound iterations are discarded** (produce time > T/3); if every
+  iteration trips this, the injector is too slow for the DUT — use
+  `--via swssconfig` (default) and check nothing else throttles docker exec.
+- **Same route set & ECMP distribution** across all rows — NextHopGroupTable
   gains scale with the number and size of next-hop groups.
 - **Fixed batch size**: orchagent.sh already pins `-b 8192`; keep both images
   identical.
 - **Neighbors must resolve**: unresolved next hops won't program to the ASIC and
   will skew / stall the count.
+- **Counters off, CRM slow**: flex counters (`counterpoll`) and fast CRM
+  polling add orchagent/syncd CPU noise; the env snapshot records what was on.
 - **One writer to sairedis.rec**: scope every measurement with `--since <marker>`
   so you never mix two runs.
+- **T1 vs T2 are different feeds** — never quote them against each other; the
+  ZMQ comparison is T1b vs T2 only.
 - **Multi-ASIC**: run per-namespace (`sonic-db-cli -n asic0 ...`, sairedis.rec is
-  `sairedis.asic0.rec`), one namespace at a time.
+  `sairedis.asic0.rec`, container `swss0`), one namespace at a time.
