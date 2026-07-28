@@ -12,10 +12,10 @@ box). The peer must already have, once:
 
 The generated batch is fed to vtysh as a single transaction:
 
-    ./gen_frr_routes.py add --count 100000 --base 10.0.0.0 > /tmp/routes_add.conf
+    ./gen_frr_routes.py add --count 30000 --base 10.0.0.0 > /tmp/routes_add.conf
     frr-vtysh < /tmp/routes_add.conf            # NOT 'vtysh -f <hostpath>' (container FS)
 
-    ./gen_frr_routes.py del --count 100000 --base 10.0.0.0 > /tmp/routes_del.conf
+    ./gen_frr_routes.py del --count 30000 --base 10.0.0.0 > /tmp/routes_del.conf
     frr-vtysh < /tmp/routes_del.conf            # withdraw between iterations
 
 Uses the same --count/--base convention as inject_routes.py so the T2 (BGP) and

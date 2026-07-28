@@ -12,9 +12,13 @@
 # iteration whose produce-side time exceeds T/3 is discarded as
 # producer-bound (T would be measuring the injector, not orchagent).
 #
-#   ./run_perf.sh --count 100000 --nexthop 192.168.1.1@Ethernet0 --iters 6
-#   ./run_perf.sh --count 50000  --nexthop 192.168.1.1@Ethernet0,192.168.1.2@Ethernet4 --iters 6
-#   ./run_perf.sh --count 100000 --nexthop 192.168.1.1@Ethernet0 --stats /tmp/perfstats
+#   ./run_perf.sh --count 30000 --nexthop 192.168.1.1@Ethernet0 --iters 6
+#   ./run_perf.sh --count 30000 --nexthop 192.168.1.1@Ethernet0,192.168.1.2@Ethernet4 --iters 6
+#   ./run_perf.sh --count 30000 --nexthop 192.168.1.1@Ethernet0 --stats /tmp/perfstats
+#
+# COUNT must fit the ASIC route table (see --max-routes): overshooting it does
+# not raise an error anywhere in the stack -- the ASIC_DB count simply stops
+# advancing partway, and every T read from that truncated batch is garbage.
 #
 # Run the SAME command on the baseline image and on the treatment image, then:
 #   improvement% = (T_baseline - T_treatment) / T_baseline * 100
@@ -22,7 +26,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REC="/var/log/swss/sairedis.rec"
-COUNT=100000
+COUNT=30000
 BASE="10.0.0.0"
 NEXTHOP=""
 ITERS=6
@@ -31,6 +35,7 @@ VIA="swssconfig"
 CONTAINER="swss"
 STATS=""
 FORCE=0
+MAX_ROUTES=32000    # ASIC route-table ceiling (this platform); see the check below
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -43,11 +48,16 @@ while [ $# -gt 0 ]; do
         --container) CONTAINER="$2"; shift 2;;    # swss container (multi-asic: swss0..)
         --stats) STATS="$2"; shift 2;;            # dir: sample proc CPU during the run
         --recfile) REC="$2"; shift 2;;            # multi-asic: /var/log/swss/sairedis.asic0.rec
+        --max-routes) MAX_ROUTES="$2"; shift 2;;  # ASIC route-table ceiling
         --force) FORCE=1; shift;;                 # skip the route-ZMQ preflight abort
         *) echo "unknown arg $1" >&2; exit 1;;
     esac
 done
 [ -n "$NEXTHOP" ] || { echo "ERROR: --nexthop required" >&2; exit 1; }
+
+asic_route_count() {
+    sonic-db-cli ASIC_DB keys "ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY:*" 2>/dev/null | wc -l
+}
 
 # --- preflight: this benchmark feeds APPL_DB, which orchagent does NOT read
 # when the route-ZMQ path is enabled. Refuse to measure a config that can't work.
@@ -63,6 +73,22 @@ fi
 if counterpoll show 2>/dev/null | grep -qi enable; then
     echo "NOTE: some flex counters are enabled (counterpoll show) -- they add"
     echo "      orchagent/syncd CPU noise; consider disabling them for the run."
+fi
+
+# --- preflight: the ASIC route table has a hard ceiling, and overshooting it is
+# SILENT: swssconfig, orchagent and syncd all report success while the ASIC_DB
+# count simply stops advancing partway. Every T read from such a truncated batch
+# is meaningless, so refuse the run instead of producing a plausible-looking
+# number. Leftover routes from an earlier run eat into the same budget.
+PRE_ROUTES="$(asic_route_count)"
+echo "existing ASIC routes: $PRE_ROUTES (ceiling $MAX_ROUTES)"
+if [ "$((PRE_ROUTES + COUNT))" -gt "$MAX_ROUTES" ]; then
+    echo "ERROR: $PRE_ROUTES existing + $COUNT injected = $((PRE_ROUTES + COUNT))," >&2
+    echo "over the ASIC route-table ceiling of $MAX_ROUTES." >&2
+    echo "Clear leftover test routes first (inject_routes.py del ... on the DUT," >&2
+    echo "withdraw on the peer), lower --count, or raise --max-routes if the" >&2
+    echo "platform allows (check 'crm show resources' for the real limit)." >&2
+    exit 1
 fi
 
 # --- optional CPU sampling for bottleneck attribution
@@ -81,10 +107,6 @@ if [ -n "$STATS" ]; then
     SAMPLER_PID=$!
     echo "CPU sampler running (pid $SAMPLER_PID) -> $STATS"
 fi
-
-asic_route_count() {
-    sonic-db-cli ASIC_DB keys "ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY:*" 2>/dev/null | wc -l
-}
 
 wait_for() {  # wait_for <target-count> <cmp: ge|le>
     local target="$1" cmp="$2" waited=0
@@ -139,6 +161,11 @@ for i in $(seq 1 "$ITERS"); do
         tag=" [warm-up: not counted]"
     elif [ "$add_got" -eq 0 ]; then
         tag=" [no creates found in $REC since marker: not counted -- was the rec rotated?]"
+    elif [ "$add_got" -lt "$((COUNT / 2))" ]; then
+        # A SET on a prefix RouteOrch already has takes the update path and emits
+        # no SAI create, so leftover routes in this prefix range shrink the batch
+        # to whatever is genuinely new. logrotate on sairedis.rec looks the same.
+        tag=" [ONLY $add_got/$COUNT creates: prefixes already present, or sairedis.rec rotated mid-run -- not counted]"
     elif producer_bound "$add_prod" "$add_ms"; then
         tag=" [PRODUCER-BOUND: not counted -- produce ${add_prod}s vs T ${add_ms}ms]"
     else

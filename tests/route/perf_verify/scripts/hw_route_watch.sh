@@ -18,10 +18,10 @@
 #
 # START THIS BEFORE TRIGGERING THE INJECTION, in a second terminal:
 #
-#   ./hw_route_watch.sh --expect 100000 &
-#   ./run_perf.sh --count 100000 --nexthop ... --iters 1
+#   ./hw_route_watch.sh --expect 30000 &
+#   ./run_perf.sh --count 30000 --nexthop ... --iters 1
 #
-# Granularity: each sample costs one bcmcmd execution, which at 100k entries
+# Granularity: each sample costs one bcmcmd execution, which at 30k entries
 # can itself take a few seconds -- so the reported lag is only meaningful to
 # within (interval + bcmcmd time). This is a cross-check, not the headline
 # number. Raise --interval at high scale to lighten the load.

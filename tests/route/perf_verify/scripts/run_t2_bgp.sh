@@ -23,10 +23,10 @@
 # aborts with an error rather than reporting a bogus T.
 #
 #   # manual trigger (you run frr-vtysh on the peer when prompted):
-#   ./run_t2_bgp.sh --expect 100000 --require-zmq true --measure-del
+#   ./run_t2_bgp.sh --expect 30000 --require-zmq true --measure-del
 #
 #   # auto trigger (script ssh-es the peer and feeds it the route batches):
-#   ./run_t2_bgp.sh --expect 100000 --require-zmq true \
+#   ./run_t2_bgp.sh --expect 30000 --require-zmq true \
 #       --peer admin@192.168.1.1 --add-file /tmp/routes_add.conf \
 #       --del-file /tmp/routes_del.conf --stats /tmp/perfstats_t2
 #
@@ -43,6 +43,7 @@ DEL_FILE=""        # path (on the peer) of the vtysh withdraw-batch
 MEASURE_DEL=0      # manual-mode: also measure the withdraw window
 REQUIRE_ZMQ=""     # true|false: abort unless the route-ZMQ flag matches
 STATS=""           # dir: sample proc CPU during the run
+MAX_ROUTES=32000   # ASIC route-table ceiling (this platform)
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -56,6 +57,7 @@ while [ $# -gt 0 ]; do
         --require-zmq) REQUIRE_ZMQ="$2"; shift 2;;
         --stats)   STATS="$2"; shift 2;;
         --recfile) REC="$2"; shift 2;;
+        --max-routes) MAX_ROUTES="$2"; shift 2;;
         *) echo "unknown arg $1" >&2; exit 1;;
     esac
 done
@@ -117,6 +119,13 @@ MARK=$(date +"%Y-%m-%d.%H:%M:%S.%6N")
 sleep 1
 
 echo "=== BGP-feed run (zmq=$ZMQ_FLAG): base_count=$BASE marker=$MARK ==="
+if [ "$EXPECT" -gt 0 ] && [ "$((BASE + EXPECT))" -gt "$MAX_ROUTES" ]; then
+    echo "ERROR: $BASE existing + $EXPECT advertised = $((BASE + EXPECT)), over the" >&2
+    echo "ASIC route-table ceiling of $MAX_ROUTES. The table would fill mid-run and" >&2
+    echo "T would be measured over a truncated batch. Clear leftovers or lower the" >&2
+    echo "peer's route set (--max-routes to override)." >&2
+    exit 1
+fi
 if [ -n "$PEER" ] && [ -n "$ADD_FILE" ]; then
     echo ">> Triggering announcement on $PEER (frr-vtysh < $ADD_FILE)"
     ssh "$PEER" "frr-vtysh < $ADD_FILE" >/dev/null
@@ -132,7 +141,26 @@ wait_idle "$BASE"
 FINAL=$(route_count)
 echo ">> Stabilized: base=$BASE final=$FINAL delta=$((FINAL - BASE))"
 if [ "$EXPECT" -gt 0 ] && [ "$((FINAL - BASE))" -lt "$EXPECT" ]; then
-    echo "!! WARNING: delta $((FINAL - BASE)) < expected $EXPECT -- batch may be incomplete; T is unreliable." >&2
+    # The count going idle short of the target has two very different causes:
+    # the table filled up (hard ceiling -- the run is void, waiting never helps)
+    # or the feed stalled and the idle timer fired early. Ask CRM for the real
+    # remaining capacity: the configured --max-routes is a guess that may sit
+    # ABOVE the hardware's actual limit, which is exactly when this misfires.
+    echo "!! WARNING: delta $((FINAL - BASE)) < expected $EXPECT -- T is unreliable." >&2
+    AVAIL="$(crm show resources 2>/dev/null | awk '/ipv4_route/ {print $NF}' | head -1)"
+    case "$AVAIL" in (*[!0-9]*|"") AVAIL="";; esac
+    if [ -n "$AVAIL" ] && [ "$AVAIL" -lt 100 ]; then
+        echo "   ASIC ROUTE TABLE FULL (crm ipv4_route available=$AVAIL): the batch was" >&2
+        echo "   truncated by capacity, not by orchagent. Clear leftovers and/or shrink" >&2
+        echo "   the peer's route set, then re-run." >&2
+    elif [ "$FINAL" -ge "$((MAX_ROUTES - MAX_ROUTES / 100))" ]; then
+        echo "   Settled at the configured ceiling ($MAX_ROUTES) -- capacity truncation." >&2
+    else
+        echo "   Table is NOT full (crm ipv4_route available=${AVAIL:-unknown}), so the" >&2
+        echo "   feed likely stalled (vtysh still parsing? session flapped?) and the idle" >&2
+        echo "   timer fired early. Raise --stable, or use a session-flap trigger so the" >&2
+        echo "   whole set arrives as one burst." >&2
+    fi
 fi
 
 echo ">> ADD window (zmq=$ZMQ_FLAG)"

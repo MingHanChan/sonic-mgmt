@@ -79,9 +79,18 @@ DUT, or run from the `sonic-mgmt` container over SSH.
   **and debug symbols for orchagent** — a production image is stripped; use an
   image built with `INSTALL_DEBUG_TOOLS=y` or install the matching `swss-dbg` /
   `libsairedis-dbg` debs, or the report is unreadable addresses.
-- Pick a route scale that matches your production table (e.g. 100k /32, and an
-  ECMP variant since NextHopGroupTable benefits scale with the number/size of
-  next-hop groups).
+- **Know the ASIC route-table ceiling and stay under it.** The defaults here
+  target a platform whose limit is **32000**, so the scripts default to
+  `--count 30000` with a `--max-routes 32000` guard. Overshooting the ceiling
+  is *silent*: swssconfig, orchagent and syncd all report success while the
+  ASIC_DB count stops advancing partway, and any T from that truncated batch
+  looks plausible but is void. Check the real limit with
+  `crm show resources | grep ipv4_route` and set `--count` / `--max-routes` to
+  match. Leftover routes from a previous run eat the same budget — the
+  orchestrators count what is already there before injecting.
+- Pick a route scale that matches your production table within that ceiling,
+  plus an ECMP variant since NextHopGroupTable benefits scale with the
+  number/size of next-hop groups.
 
 ## Measurement matrix
 
@@ -131,11 +140,11 @@ cd scripts
 # run_perf.sh aborts if the route-ZMQ flag is on (orchagent would not consume
 # APPL_DB ROUTE_TABLE) -- no manual flag check needed.
 
-# 100k single-nexthop routes, 6 iterations (first discarded), with CPU sampling
-./run_perf.sh --count 100000 --nexthop 192.168.1.1@Ethernet0 --iters 6 --stats /tmp/perfstats_t1
+# 30k single-nexthop routes, 6 iterations (first discarded), with CPU sampling
+./run_perf.sh --count 30000 --nexthop 192.168.1.1@Ethernet0 --iters 6 --stats /tmp/perfstats_t1
 
 # ECMP variant (stresses NextHopGroupTable the most)
-./run_perf.sh --count 50000 \
+./run_perf.sh --count 30000 \
     --nexthop 192.168.1.1@Ethernet0,192.168.1.2@Ethernet4,192.168.1.3@Ethernet8,192.168.1.4@Ethernet12 \
     --iters 6
 ```
@@ -187,8 +196,8 @@ redistribute them into BGP.
 2. Generate the add/withdraw batches (same route set as B/T1, on the peer):
 
    ```bash
-   ./scripts/gen_frr_routes.py add --count 100000 --base 10.0.0.0 > /tmp/routes_add.conf
-   ./scripts/gen_frr_routes.py del --count 100000 --base 10.0.0.0 > /tmp/routes_del.conf
+   ./scripts/gen_frr_routes.py add --count 30000 --base 10.0.0.0 > /tmp/routes_add.conf
+   ./scripts/gen_frr_routes.py del --count 30000 --base 10.0.0.0 > /tmp/routes_del.conf
    ```
 
 3. Drive the run from the DUT with the BGP orchestrator (marks time, waits for
@@ -200,17 +209,17 @@ redistribute them into BGP.
 
    ```bash
    # T1b row, auto-trigger (script ssh-es the peer, measures add + withdraw):
-   ./scripts/run_t2_bgp.sh --expect 100000 --require-zmq false \
+   ./scripts/run_t2_bgp.sh --expect 30000 --require-zmq false \
        --peer admin@192.168.1.1 --add-file /tmp/routes_add.conf \
        --del-file /tmp/routes_del.conf --stats /tmp/perfstats_t1b
 
    # T2 row, same command with the flag flipped on the DUT first:
-   ./scripts/run_t2_bgp.sh --expect 100000 --require-zmq true \
+   ./scripts/run_t2_bgp.sh --expect 30000 --require-zmq true \
        --peer admin@192.168.1.1 --add-file /tmp/routes_add.conf \
        --del-file /tmp/routes_del.conf --stats /tmp/perfstats_t2
 
    # or manual (it prompts; run 'frr-vtysh < /tmp/routes_add.conf' on the peer):
-   ./scripts/run_t2_bgp.sh --expect 100000 --require-zmq true --measure-del
+   ./scripts/run_t2_bgp.sh --expect 30000 --require-zmq true --measure-del
    ```
 
    > Feed the batch with `frr-vtysh < file` (stdin), NOT `vtysh -f <hostpath>`:
@@ -229,7 +238,7 @@ Advertise the same route set with **exabgp** on the test host / a neighbor
 container:
 
    ```
-   # exabgp.conf (announce 100k /32 from a single peer)
+   # exabgp.conf (announce 30k /32 from a single peer)
    neighbor <DUT_BGP_IP> {
        router-id 10.9.9.9;
        local-address <PEER_IP>;
@@ -239,7 +248,7 @@ container:
        api { processes [ announcer ]; }
    }
    process announcer {
-       run /usr/bin/python3 /path/to/announce_100k.py;   # loops 'announce route 10.0.i.j/32 next-hop <PEER_IP>'
+       run /usr/bin/python3 /path/to/announce_30k.py;   # loops 'announce route 10.0.i.j/32 next-hop <PEER_IP>'
        encoder text;
    }
    ```
@@ -294,14 +303,14 @@ be invisible to T. Once per scenario (not every iteration), start the watcher
 before the injection:
 
 ```bash
-./scripts/hw_route_watch.sh --expect 100000 &     # may need --count-cmd 'sudo bcmcmd "l3 defip show"'
-./scripts/run_perf.sh --count 100000 --nexthop 192.168.1.1@Ethernet0 --iters 1
+./scripts/hw_route_watch.sh --expect 30000 &     # may need --count-cmd 'sudo bcmcmd "l3 defip show"'
+./scripts/run_perf.sh --count 30000 --nexthop 192.168.1.1@Ethernet0 --iters 1
 ```
 
 It polls ASIC_DB and `bcmcmd "l3 defip show"` side by side and reports the lag
 between the two completion times. Small lag (≈ polling granularity) -> the
 sairedis.rec window is a fair proxy for hardware completion; large lag ->
-quote the hardware time. Each bcmcmd at 100k entries can take a few seconds,
+quote the hardware time. Each bcmcmd at 30k entries can take a few seconds,
 so raise `--interval` at high scale; this is a cross-check, not the headline.
 
 ---
@@ -313,7 +322,7 @@ before injecting an ECMP-heavy batch:
 
 ```bash
 ./scripts/profile_orchagent.sh 60 /tmp/orchagent_perf.txt &
-./scripts/run_perf.sh --count 50000 --nexthop 192.168.1.1@Ethernet0,192.168.1.2@Ethernet4 --iters 1
+./scripts/run_perf.sh --count 30000 --nexthop 192.168.1.1@Ethernet0,192.168.1.2@Ethernet4 --iters 1
 ```
 
 In the report, on the **baseline** image you should see a large share under the
@@ -371,8 +380,19 @@ numbers, verify on the treatment image with ZMQ on:
   will skew / stall the count.
 - **Counters off, CRM slow**: flex counters (`counterpoll`) and fast CRM
   polling add orchagent/syncd CPU noise; the env snapshot records what was on.
+- **Start from a clean table**: a `SET` on a prefix RouteOrch already holds
+  takes the *update* path and emits **no SAI create**, so leftover routes in
+  the injected prefix range silently shrink the batch to whatever is genuinely
+  new — a run reporting far fewer creates than `--count` is this. Withdraw on
+  the peer *and* `inject_routes.py del` on the DUT between scenarios, and
+  confirm the count is back to its pre-test baseline.
 - **One writer to sairedis.rec**: scope every measurement with `--since <marker>`
   so you never mix two runs.
+- **sairedis.rec rotates**: logrotate is configured for `/var/log/swss/sairedis*.rec`
+  at `size 1M` (small-disk images) or `16M`. A long or large run can rotate the
+  file mid-measurement, after which `--since` only sees the tail and the create
+  count comes back far too low. Check `ls -la /var/log/swss/sairedis.rec*` after
+  a suspicious run; truncate before a scenario rather than mid-run.
 - **T1 vs T2 are different feeds** — never quote them against each other; the
   ZMQ comparison is T1b vs T2 only.
 - **Multi-ASIC**: run per-namespace (`sonic-db-cli -n asic0 ...`, sairedis.rec is

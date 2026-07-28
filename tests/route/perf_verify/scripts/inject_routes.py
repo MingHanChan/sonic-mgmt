@@ -27,15 +27,15 @@ the measured programming window T and discards iterations where the producer
 was too slow to saturate orchagent (produce time > T/3).
 
 Examples:
-    # 100k /32 single-nexthop routes starting at 10.0.0.0
-    ./inject_routes.py add --count 100000 --base 10.0.0.0 --nexthop 192.168.1.1@Ethernet0
+    # 30k /32 single-nexthop routes starting at 10.0.0.0
+    ./inject_routes.py add --count 30000 --base 10.0.0.0 --nexthop 192.168.1.1@Ethernet0
 
-    # 50k routes, 4-way ECMP (stresses NextHopGroupTable the most)
-    ./inject_routes.py add --count 50000 --base 20.0.0.0 \
+    # same count, 4-way ECMP (stresses NextHopGroupTable the most)
+    ./inject_routes.py add --count 30000 --base 20.0.0.0 \
         --nexthop 192.168.1.1@Ethernet0,192.168.1.2@Ethernet4,192.168.1.3@Ethernet8,192.168.1.4@Ethernet12
 
     # remove the same batch afterwards
-    ./inject_routes.py del --count 100000 --base 10.0.0.0
+    ./inject_routes.py del --count 30000 --base 10.0.0.0
 """
 import argparse
 import ipaddress
