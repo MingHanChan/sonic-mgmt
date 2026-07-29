@@ -88,26 +88,41 @@ def rec_segments(recfile):
 def scan_segment(path, actions, since, first, last, count):
     """Fold one rec segment into the running (first, last, count). Uses global
     min/max rather than first-seen/last-seen because, once segments are
-    stitched, chronological order is not guaranteed across files."""
+    stitched, chronological order is not guaranteed across files.
+
+    Tolerant of a segment that logrotate mutates underneath us: between the
+    glob that discovered it and this open, or mid-read, logrotate (the SONiC
+    cron fires it every 10 min) can rename it (.1 -> .2), compress it
+    (.1 -> .1.gz) or delete it. A vanished or half-written/half-compressed
+    segment must not abort the whole measurement -- skip it and note it on
+    stderr. Its rows are either already counted from the sibling it moved to,
+    or genuinely gone (in which case run_perf.sh's ASIC_DB delta is the
+    authoritative route count, not this line tally)."""
     opener = gzip.open if path.endswith(".gz") else open
-    with opener(path, "rt", errors="replace") as f:
-        for line in f:
-            if "SAI_OBJECT_TYPE_ROUTE_ENTRY" not in line:
-                continue
-            fields = line.split("|", 2)
-            if len(fields) < 2 or fields[1] not in actions:
-                continue
-            m = TS_RE.match(line)
-            if not m:
-                continue
-            ts = parse_ts(m.group(1))
-            if since and ts < since:
-                continue
-            if first is None or ts < first:
-                first = ts
-            if last is None or ts > last:
-                last = ts
-            count += 1
+    try:
+        with opener(path, "rt", errors="replace") as f:
+            for line in f:
+                if "SAI_OBJECT_TYPE_ROUTE_ENTRY" not in line:
+                    continue
+                fields = line.split("|", 2)
+                if len(fields) < 2 or fields[1] not in actions:
+                    continue
+                m = TS_RE.match(line)
+                if not m:
+                    continue
+                ts = parse_ts(m.group(1))
+                if since and ts < since:
+                    continue
+                if first is None or ts < first:
+                    first = ts
+                if last is None or ts > last:
+                    last = ts
+                count += 1
+    except (OSError, EOFError) as e:
+        # FileNotFoundError/BadGzipFile are OSError subclasses; a truncated gz
+        # raises EOFError. All mean "logrotate is touching this segment".
+        print("note: skipped rec segment %s (%s)" % (path, e.__class__.__name__),
+              file=sys.stderr)
     return first, last, count
 
 
