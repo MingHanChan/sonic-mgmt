@@ -4,11 +4,11 @@ Inject / withdraw a fixed batch of routes into APPL_DB ROUTE_TABLE. Run this
 ON the DUT. Two transports:
 
   --via swssconfig (default)
-      Generate a swssconfig JSON batch, docker-cp it into the swss container
-      and run `swssconfig` there. swssconfig is C++ and writes through a
-      buffered RedisPipeline (flushed on exit), so the produce side is fast
-      enough not to become the bottleneck of the measurement. This is the same
-      channel tests/route/test_route_perf.py uses.
+      Generate a swssconfig JSON batch, stream it into the swss container and
+      run `swssconfig` there. swssconfig is C++ and writes through a buffered
+      RedisPipeline (flushed on exit), so the produce side is fast enough not
+      to become the bottleneck of the measurement. This is the same channel
+      tests/route/test_route_perf.py uses.
 
   --via redis
       Python swsscommon ProducerStateTable, kept as a fallback when docker
@@ -67,7 +67,7 @@ def route_fields(nexthop_val, ifname_val):
 
 
 def inject_via_swssconfig(args, nexthop_val, ifname_val):
-    """Returns (count, produce_seconds). Staging (JSON gen + docker cp) is NOT
+    """Returns (count, produce_seconds). Staging (JSON gen + transfer) is NOT
     counted; produce time is the swssconfig execution only."""
     entries = []
     for prefix in gen_prefixes(args.base, args.count):
@@ -78,20 +78,38 @@ def inject_via_swssconfig(args, nexthop_val, ifname_val):
         else:
             entries.append({key: {}, "OP": "DEL"})
 
-    host_json = "/tmp/perf_routes_%s_%d.json" % (args.op, os.getpid())
-    ctr_json = "/tmp/%s" % os.path.basename(host_json)
-    with open(host_json, "w") as f:
-        json.dump(entries, f, separators=(",", ":"))
+    payload = json.dumps(entries, separators=(",", ":")).encode()
+    ctr_json = "/tmp/perf_routes_%s_%d.json" % (args.op, os.getpid())
 
+    # Write the batch from INSIDE the container, not with 'docker cp'. SONiC
+    # starts swss with '--tmpfs /tmp' (docker_image_ctl.j2, mount_default_tmpfs),
+    # and docker cp writes to the rootfs layer *underneath* a tmpfs mount rather
+    # than into the mount: it exits 0 while the file stays invisible to
+    # processes in the container, and swssconfig then dies with
+    # 'Failed to open file'. 'docker exec -i' goes through the container's own
+    # mount namespace, so this works whether /tmp is a tmpfs, a bind mount or a
+    # plain directory.
     try:
-        subprocess.run(["docker", "cp", host_json, "%s:%s" % (args.container, ctr_json)],
-                       check=True)
+        subprocess.run(["docker", "exec", "-i", args.container,
+                        "sh", "-c", "cat > '%s'" % ctr_json],
+                       input=payload, check=True)
+
+        # Confirm the whole batch landed. A short write (e.g. the container's
+        # tmpfs filling up) would otherwise silently shrink the workload and
+        # every T measured from it would be void.
+        wc = subprocess.run(["docker", "exec", args.container, "wc", "-c", ctr_json],
+                            check=True, capture_output=True, text=True)
+        written = int(wc.stdout.split()[0])
+        if written != len(payload):
+            raise RuntimeError(
+                "batch transfer truncated: wrote %d of %d bytes into %s:%s"
+                % (written, len(payload), args.container, ctr_json))
+
         t0 = time.time()
         subprocess.run(["docker", "exec", "-i", args.container, "swssconfig", ctr_json],
                        check=True)
         dt = time.time() - t0
     finally:
-        os.unlink(host_json)
         subprocess.run(["docker", "exec", args.container, "rm", "-f", ctr_json],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return len(entries), dt

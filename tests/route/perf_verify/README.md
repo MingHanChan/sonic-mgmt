@@ -369,6 +369,15 @@ numbers, verify on the treatment image with ZMQ on:
 ## Gotchas
 
 - **Warm-up**: the orchestrators discard iteration 1. Keep it.
+- **Never stage a file into the swss container with `docker cp`.** SONiC starts
+  its containers with `--tmpfs /tmp` (`docker_image_ctl.j2`,
+  `mount_default_tmpfs`), and `docker cp` writes to the rootfs layer
+  *underneath* a tmpfs mount instead of into it: the copy exits 0 while the
+  file remains invisible inside the container, and `swssconfig` fails with
+  `Failed to open file /tmp/...`. `inject_routes.py` streams the batch in via
+  `docker exec -i` (the container's own mount namespace) and verifies the byte
+  count; use the same approach for anything else you stage there. Same family
+  of gotcha as `frr-vtysh < file` vs `vtysh -f <hostpath>` above.
 - **Producer-bound iterations are discarded** (produce time > T/3); if every
   iteration trips this, the injector is too slow for the DUT — use
   `--via swssconfig` (default) and check nothing else throttles docker exec.
