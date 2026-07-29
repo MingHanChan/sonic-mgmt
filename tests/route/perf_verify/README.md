@@ -378,9 +378,21 @@ numbers, verify on the treatment image with ZMQ on:
   `docker exec -i` (the container's own mount namespace) and verifies the byte
   count; use the same approach for anything else you stage there. Same family
   of gotcha as `frr-vtysh < file` vs `vtysh -f <hostpath>` above.
-- **Producer-bound iterations are discarded** (produce time > T/3); if every
-  iteration trips this, the injector is too slow for the DUT — use
-  `--via swssconfig` (default) and check nothing else throttles docker exec.
+- **Producer-bound iterations are discarded** (produce time > T/3). `swssconfig`
+  is already the fastest injector available (C++ buffered pipeline); its ceiling
+  on a given DUT is fixed (measured ~2000–2500 routes/s on a modest control-plane
+  CPU). If orchagent programs at a similar rate, T is dominated by the feed and
+  **every** iteration is discarded — that is not a bug, the Redis micro-benchmark
+  just cannot isolate orchagent on that unit. `run_perf.sh` says so at the end and
+  points you at the feed-independent tools: `profile_orchagent.sh` for change #2
+  and `run_t2_bgp.sh` (BGP feed) for change #3. A bigger `--count` does not help —
+  produce time scales with it too.
+- **Routes are recorded in BULK.** orchagent writes SAI route ops as bulk `C`
+  (create) / `R` (remove) records — one sairedis.rec line packs ~hundreds of
+  routes — so ~50 lines for 30000 routes is normal, not truncation. The
+  orchestrator prints both counts (`add 30000 routes / 50 SAI ops`) and gates
+  validity on the **ASIC_DB delta** (the real route count), never on the line
+  count; T is still first-op to last-op across those bulk lines.
 - **Same route set & ECMP distribution** across all rows — NextHopGroupTable
   gains scale with the number and size of next-hop groups.
 - **Fixed batch size**: orchagent.sh already pins `-b 8192`; keep both images
@@ -392,16 +404,23 @@ numbers, verify on the treatment image with ZMQ on:
 - **Start from a clean table**: a `SET` on a prefix RouteOrch already holds
   takes the *update* path and emits **no SAI create**, so leftover routes in
   the injected prefix range silently shrink the batch to whatever is genuinely
-  new — a run reporting far fewer creates than `--count` is this. Withdraw on
-  the peer *and* `inject_routes.py del` on the DUT between scenarios, and
-  confirm the count is back to its pre-test baseline.
+  new. This shows up as the **ASIC_DB delta** falling short of `--count` (the
+  orchestrator's `ONLY <delta>/<count> routes reached ASIC_DB` discard), not as
+  a low SAI-op line count (that is just bulk recording — see above). Withdraw on
+  the peer *and* `inject_routes.py del` on the DUT between scenarios, and confirm
+  the count is back to its pre-test baseline.
 - **One writer to sairedis.rec**: scope every measurement with `--since <marker>`
   so you never mix two runs.
-- **sairedis.rec rotates**: logrotate is configured for `/var/log/swss/sairedis*.rec`
-  at `size 1M` (small-disk images) or `16M`. A long or large run can rotate the
-  file mid-measurement, after which `--since` only sees the tail and the create
-  count comes back far too low. Check `ls -la /var/log/swss/sairedis.rec*` after
-  a suspicious run; truncate before a scenario rather than mid-run.
+- **sairedis.rec rotates**: logrotate (`files/image_config/logrotate/rsyslog.j2`,
+  fired every 10 min by cron) rotates `/var/log/swss/sairedis*.rec` at `size 1M`
+  (small-disk images) or `16M`, keeping segments (`rotate 5000`, `.1` plain and
+  `.2+` gz) and SIGHUPing orchagent to reopen. A run that straddles a rotation
+  therefore has its records split across `sairedis.rec`, `.rec.1`, `.rec.2.gz` …
+  `measure_route_time.py` stitches those siblings back together when `--since` is
+  given and tolerates logrotate mutating a segment mid-read, so this no longer
+  corrupts T. If a segment is genuinely deleted (disk pressure), the ASIC_DB
+  delta still validates the route count and the affected iteration surfaces as a
+  T outlier caught by the stddev check.
 - **T1 vs T2 are different feeds** — never quote them against each other; the
   ZMQ comparison is T1b vs T2 only.
 - **Multi-ASIC**: run per-namespace (`sonic-db-cli -n asic0 ...`, sairedis.rec is

@@ -153,6 +153,8 @@ INJ_ARGS=(--count "$COUNT" --base "$BASE" --via "$VIA" --container "$CONTAINER" 
 
 ADD_RESULTS=()
 DEL_RESULTS=()
+PRODUCER_BOUND_HITS=0
+add_prod=""      # last add produce time, for the producer-rate hint at the end
 echo "=== route-perf: COUNT=$COUNT ITERS=$ITERS NEXTHOP=$NEXTHOP VIA=$VIA ==="
 for i in $(seq 1 "$ITERS"); do
     base_cnt="$(asic_route_count)"
@@ -166,6 +168,13 @@ for i in $(seq 1 "$ITERS"); do
         wait_for "$base_cnt" le || true
         continue
     fi
+    # ASIC_DB delta is the authoritative count of routes programmed this iter.
+    # The sairedis line count is NOT: orchagent records routes in BULK ('C'),
+    # one line covering ~hundreds of routes (30000 routes -> ~50 lines), so
+    # gating on the line count wrongly discarded valid runs. Gate validity on
+    # the delta; use the sairedis timestamps only for the T window.
+    add_asic="$(asic_route_count)"
+    add_delta="$((add_asic - base_cnt))"
     read -r add_got add_ms < <(python3 "$HERE/measure_route_time.py" "$REC" \
                                --since "$marker" --op create --quiet)
 
@@ -180,14 +189,15 @@ for i in $(seq 1 "$ITERS"); do
     tag=""
     if [ "$i" -eq 1 ]; then
         tag=" [warm-up: not counted]"
+    elif [ "$add_delta" -lt "$COUNT" ]; then
+        # wait_for already blocked until base_cnt+COUNT, so this only trips on a
+        # genuine partial program (ASIC table ceiling, leftover prefixes taking
+        # the no-SAI update path) -- a real reason to distrust T.
+        tag=" [ONLY $add_delta/$COUNT routes reached ASIC_DB: not counted]"
     elif [ "$add_got" -eq 0 ]; then
-        tag=" [no creates found in $REC since marker: not counted -- was the rec rotated?]"
-    elif [ "$add_got" -lt "$((COUNT / 2))" ]; then
-        # A SET on a prefix RouteOrch already has takes the update path and emits
-        # no SAI create, so leftover routes in this prefix range shrink the batch
-        # to whatever is genuinely new. logrotate on sairedis.rec looks the same.
-        tag=" [ONLY $add_got/$COUNT creates: prefixes already present, or sairedis.rec rotated mid-run -- not counted]"
+        tag=" [no create records in $REC since marker: no timing -- rec deleted by logrotate?]"
     elif producer_bound "$add_prod" "$add_ms"; then
+        PRODUCER_BOUND_HITS=$((PRODUCER_BOUND_HITS + 1))
         tag=" [PRODUCER-BOUND: not counted -- produce ${add_prod}s vs T ${add_ms}ms]"
     else
         ADD_RESULTS+=("$add_ms")
@@ -199,8 +209,8 @@ for i in $(seq 1 "$ITERS"); do
             DEL_RESULTS+=("$del_ms")
         fi
     fi
-    printf "iter %d: add %s routes T=%s ms (produce %ss) | del %s routes T=%s ms (produce %ss)%s\n" \
-        "$i" "$add_got" "$add_ms" "$add_prod" "$del_got" "$del_ms" "$del_prod" "$tag"
+    printf "iter %d: add %s routes / %s SAI ops T=%s ms (produce %ss) | del %s SAI ops T=%s ms (produce %ss)%s\n" \
+        "$i" "$add_delta" "$add_got" "$add_ms" "$add_prod" "$del_got" "$del_ms" "$del_prod" "$tag"
 done
 
 summarize() {  # summarize <label> <values...>
@@ -228,6 +238,32 @@ echo
 echo "=== summary (iteration 1 discarded as warm-up; producer-bound iterations discarded) ==="
 summarize "ADD window" "${ADD_RESULTS[@]:-}"
 summarize "DEL window" "${DEL_RESULTS[@]:-}"
-echo
-echo ">> record these T means for baseline vs treatment, then:"
-echo "   improvement% = (T_base - T_treatment) / T_base * 100"
+
+# If nothing survived and the reason was producer-bound, the Redis micro-benchmark
+# simply cannot isolate orchagent on this DUT -- say so and point at the tools
+# that do not depend on the producer's speed, rather than leaving an empty result.
+if [ "${#ADD_RESULTS[@]}" -eq 0 ] && [ "$PRODUCER_BOUND_HITS" -gt 0 ]; then
+    python3 - "$COUNT" "${add_prod:-0}" <<'PY'
+import sys
+count = float(sys.argv[1]); prod = float(sys.argv[2] or 0)
+rate = count / prod if prod > 0 else 0
+print()
+print("!! Every counted add iteration was PRODUCER-BOUND on this DUT.")
+if rate:
+    print("   swssconfig feeds ~%.0f routes/s here, comparable to orchagent's" % rate)
+    print("   programming rate, so produce took a large fraction of the window T")
+else:
+    print("   produce took a large fraction of the window T,")
+print("   -- T is dominated by the FEED, not by orchagent. The Redis micro-")
+print("   benchmark therefore cannot isolate the orchagent changes (#1 swss.rec,")
+print("   #2 NextHopGroupTable) on this unit. Use the feed-independent tools:")
+print("     #2  ./profile_orchagent.sh 60 /tmp/oa.txt &   (then an ECMP run below)")
+print("         reads the map->hash CPU share straight from perf, any feed speed")
+print("     #3  ./run_t2_bgp.sh ...   BGP feed, no swssconfig producer at all")
+print("   See README 'Validating change #2' and 'Rows T1b / T2'.")
+PY
+else
+    echo
+    echo ">> record these T means for baseline vs treatment, then:"
+    echo "   improvement% = (T_base - T_treatment) / T_base * 100"
+fi
