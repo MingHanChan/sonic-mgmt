@@ -82,6 +82,8 @@ def main():
     ap.add_argument("--prefix-base", default="100.0.0.0")
     ap.add_argument("--prefix-len", type=int, default=24)
     ap.add_argument("--seed", type=int, default=20260729)
+    ap.add_argument("--frr-wrap", action="store_true",
+                    help="frr 模式:用 'configure terminal' / 'end' 包起來,方便 vtysh -f 載入")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -124,6 +126,8 @@ def main():
     with open(args.out, "w") as f:
         if args.mode == "swssconfig":
             json.dump(swss_json, f, indent=2)
+        elif args.mode == "frr" and args.frr_wrap:
+            f.write("configure terminal\n" + "\n".join(lines) + "\nend\n")
         else:
             f.write("\n".join(lines) + "\n")
 
@@ -131,8 +135,12 @@ def main():
         print("[gen] %s: %d routes, ecmp=%d, distinct groups=%d, nh pool=%d"
               % (args.out, args.count, args.ecmp, args.groups, args.nh_count))
         if args.ecmp < 2:
-            print("[gen] WARNING: ecmp<2 -> 不會建立任何 next hop group,"
-                  "unordered_map 這個改動不會被觸發", file=sys.stderr)
+            print("[gen] NOTE: ecmp<2 -> 不會建立 next hop group;測 unordered_map 要 ecmp>=2,"
+                  "但單 nexthop 足以測 ZMQ(見 README §0-(5))", file=sys.stderr)
+        if args.mode == "kernel":
+            print("[gen] WARNING: kernel 模式(ip -batch)灌的路由到不了 fpmsyncd,"
+                  "測不到 ZMQ/orchagent;測 ZMQ 請用 --mode frr,見 README §0-(4)",
+                  file=sys.stderr)
     else:
         print("[gen] %s: %d delete entries" % (args.out, args.count))
 
