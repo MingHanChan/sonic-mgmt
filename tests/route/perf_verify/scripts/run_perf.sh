@@ -55,6 +55,27 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$NEXTHOP" ] || { echo "ERROR: --nexthop required" >&2; exit 1; }
 
+# --- preflight: the helper scripts must be the same vintage as this
+# orchestrator. Copying only some files onto a DUT leaves e.g. an older
+# inject_routes.py that does not understand --via/--quiet, and the run dies
+# with an argparse error after the first inject.
+require_helper() {  # require_helper <script> <flag-it-must-support>
+    local script="$1" flag="$2"
+    [ -f "$HERE/$script" ] || {
+        echo "ERROR: $HERE/$script is missing -- copy the WHOLE scripts/ dir to this DUT." >&2
+        exit 1
+    }
+    python3 "$HERE/$script" --help 2>/dev/null | grep -q -- "$flag" || {
+        echo "ERROR: $HERE/$script is older than this orchestrator (no '$flag')." >&2
+        echo "Re-copy the WHOLE scripts/ directory to this DUT -- mixing vintages" >&2
+        echo "fails mid-run or, worse, silently measures the wrong thing." >&2
+        exit 1
+    }
+}
+require_helper inject_routes.py --via
+require_helper measure_route_time.py --op
+[ -z "$STATS" ] || require_helper sample_proc_cpu.py --out
+
 asic_route_count() {
     sonic-db-cli ASIC_DB keys "ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY:*" 2>/dev/null | wc -l
 }

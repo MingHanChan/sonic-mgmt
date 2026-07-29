@@ -62,6 +62,24 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+# --- preflight: helper scripts must be the same vintage as this orchestrator.
+# A partial copy onto a DUT (old measure_route_time.py, no --op) otherwise fails
+# only after the route batch has already been sent -- wasting the whole run.
+require_helper() {  # require_helper <script> <flag-it-must-support>
+    local script="$1" flag="$2"
+    [ -f "$HERE/$script" ] || {
+        echo "ERROR: $HERE/$script is missing -- copy the WHOLE scripts/ dir to this DUT." >&2
+        exit 1
+    }
+    python3 "$HERE/$script" --help 2>/dev/null | grep -q -- "$flag" || {
+        echo "ERROR: $HERE/$script is older than this orchestrator (no '$flag')." >&2
+        echo "Re-copy the WHOLE scripts/ directory to this DUT." >&2
+        exit 1
+    }
+}
+require_helper measure_route_time.py --op
+[ -z "$STATS" ] || require_helper sample_proc_cpu.py --out
+
 route_count() { sonic-db-cli ASIC_DB keys "ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY:*" | wc -l; }
 
 # --- label the run with the route-ZMQ flag so T1b and T2 results can't be mixed up
