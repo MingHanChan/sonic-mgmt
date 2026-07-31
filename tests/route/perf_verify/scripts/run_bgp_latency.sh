@@ -226,13 +226,42 @@ fi
 
 # 4) ASIC route-table headroom. Overshooting is silent: the count just stops
 # advancing and every latency number computed off the truncated batch is void.
+#
+# Ask CRM first -- it is the hardware's own accounting of the ipv4_route table,
+# so it knows the real ceiling. --max-routes is only a static guess and is used
+# as a fallback when CRM is unreadable. Note the ASIC_DB ROUTE_ENTRY count
+# (below) spans v4 AND v6 plus system routes, so it is NOT comparable to the
+# ipv4_route budget -- it is recorded as the run's baseline, not as the gate.
 ASIC_BASE="$(asic_route_count)"
-echo "ASIC routes before the run: $ASIC_BASE (ceiling $MAX_ROUTES)"
-if [ "$((ASIC_BASE + COUNT))" -gt "$MAX_ROUTES" ]; then
-    echo "ERROR: $ASIC_BASE existing + $COUNT announced = $((ASIC_BASE + COUNT)), over the" >&2
-    echo "ASIC route-table ceiling of $MAX_ROUTES. Check 'crm show resources | grep ipv4_route'," >&2
-    echo "clear leftovers, lower --count, or raise --max-routes." >&2
-    exit 1
+CRM_LINE="$(crm show resources 2>/dev/null | awk '/ipv4_route/ {print; exit}')"
+CRM_USED="$(echo "$CRM_LINE" | awk '{print $2}')"
+CRM_AVAIL="$(echo "$CRM_LINE" | awk '{print $NF}')"
+case "$CRM_USED"  in (*[!0-9]*|"") CRM_USED="";;  esac
+case "$CRM_AVAIL" in (*[!0-9]*|"") CRM_AVAIL="";; esac
+
+echo "ASIC_DB route entries (v4+v6+system): $ASIC_BASE"
+if [ -n "$CRM_AVAIL" ] && [ -n "$CRM_USED" ]; then
+    echo "CRM ipv4_route: used $CRM_USED, available $CRM_AVAIL (hardware ceiling $((CRM_USED + CRM_AVAIL)))"
+    if [ "$COUNT" -gt "$CRM_AVAIL" ]; then
+        echo "ERROR: announcing $COUNT ipv4 routes but only $CRM_AVAIL fit in the ASIC." >&2
+        echo "The table would fill mid-run and every latency number would be measured" >&2
+        echo "over a truncated batch. Either:" >&2
+        echo "  * lower the scale on BOTH sides: --count $CRM_AVAIL or less (and the same" >&2
+        echo "    --count on the peer's 'prep_bgp_burst.sh prepare')" >&2
+        echo "  * or clear leftover test routes first, then re-run" >&2
+        echo "(CRM polls every 'crm config polling interval' seconds -- if you just" >&2
+        echo "cleared routes, this number may be stale by up to that long.)" >&2
+        exit 1
+    fi
+else
+    echo "CRM ipv4_route unreadable -- falling back to the --max-routes guess ($MAX_ROUTES)"
+    if [ "$((ASIC_BASE + COUNT))" -gt "$MAX_ROUTES" ]; then
+        echo "ERROR: $ASIC_BASE existing + $COUNT announced = $((ASIC_BASE + COUNT)), over the" >&2
+        echo "assumed ceiling of $MAX_ROUTES. Check the real limit with" >&2
+        echo "'crm show resources | grep ipv4_route', then lower --count (to at most" >&2
+        echo "$((MAX_ROUTES - ASIC_BASE)) here), clear leftovers, or raise --max-routes." >&2
+        exit 1
+    fi
 fi
 
 # 5) sairedis.rec rotation. The analyzer stitches rotated siblings, but a
