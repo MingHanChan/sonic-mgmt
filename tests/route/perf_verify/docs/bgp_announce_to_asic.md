@@ -216,6 +216,7 @@ time when it starts forwarding.
 
 | Symptom | Cause |
 |---------|-------|
+| `no established ipv4 session with <peer>` although `show bgp … summary` shows it up | the image uses `frr-vtysh`, not `vtysh`, so the summary query returned nothing. Both scripts auto-detect `frr-vtysh`; if yours is named differently pass `--vtysh <cmd>`. PfxRcd=0 on an established session is **not** this error — 0 is valid and passes |
 | `no BGP UPDATE packets >= 60 bytes` | wrong `--peer-ip` or `--iface`; multi-asic needs `--netns asic0`; the peer never released |
 | `first SAI create precedes the first UPDATE` | swss container clock/timezone ≠ host's, or a stale marker |
 | `only X/N announced prefixes have a SAI create` | ASIC table full, an inbound filter on the DUT, or the peer never finished preloading |

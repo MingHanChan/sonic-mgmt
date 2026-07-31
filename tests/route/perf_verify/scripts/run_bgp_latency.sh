@@ -38,6 +38,7 @@ BASE="10.0.0.0"
 IFACE="any"
 NETNS=""             # multi-asic: asic0, asic1, ...
 CONTAINER="swss"
+VTYSH=""             # vtysh command; empty = auto-detect frr-vtysh / vtysh
 OUT="/tmp/bgpperf"
 POLL=2               # ASIC_DB poll interval (completion detection ONLY)
 STABLE=10            # wall-clock seconds of no progress => finished/stalled
@@ -60,6 +61,7 @@ while [ $# -gt 0 ]; do
         --iface) IFACE="$2"; shift 2;;
         --netns) NETNS="$2"; shift 2;;
         --container) CONTAINER="$2"; shift 2;;
+        --vtysh) VTYSH="$2"; shift 2;;
         --out) OUT="$2"; shift 2;;
         --poll) POLL="$2"; shift 2;;
         --stable) STABLE="$2"; shift 2;;
@@ -81,15 +83,33 @@ if [ "$NO_TRIGGER" -eq 0 ]; then
     }
 fi
 
+# vtysh command name varies by image: stock SONiC ships 'vtysh' on the host,
+# but this QUANTA image (and the rest of this toolkit -- gen_frr_routes.py,
+# run_t2_bgp.sh) uses 'frr-vtysh', a wrapper that execs into the bgp container.
+# Calling the wrong one returns nothing, and pfx_rcd then reads an empty string
+# as -1 and aborts with a bogus "no established session". Auto-detect it.
+if [ -z "$VTYSH" ]; then
+    if command -v frr-vtysh >/dev/null 2>&1; then
+        VTYSH="frr-vtysh"
+    else
+        VTYSH="vtysh"
+    fi
+fi
+
 # Namespace flags differ per tool: sonic-db-cli takes the namespace NAME
-# (-n asic0), vtysh takes the asic INDEX (-n 0), and tcpdump has to be run
+# (-n asic0), plain vtysh takes the asic INDEX (-n 0), and tcpdump has to be run
 # inside the netns. Getting these mixed up silently reads the wrong ASIC.
-NS_ARG=""; VTYSH_ARG=""; NS_EXEC=""
+NS_ARG=""; NS_EXEC=""; VTYSH_CMD="$VTYSH"
 if [ -n "$NETNS" ]; then
     NS_ARG="-n $NETNS"
-    VTYSH_ARG="-n ${NETNS#asic}"
     NS_EXEC="ip netns exec $NETNS"   # no sudo: we already exec under sudo sh -c
+    case "$VTYSH" in
+        vtysh) VTYSH_CMD="vtysh -n ${NETNS#asic}";;
+        *) echo "NOTE: multi-asic with '$VTYSH'; if PfxRcd reads wrong, pass the" >&2
+           echo "      namespaced command explicitly: --vtysh 'vtysh -n ${NETNS#asic}'." >&2;;
+    esac
 fi
+echo "vtysh command: $VTYSH_CMD"
 
 mkdir -p "$OUT"
 
@@ -105,17 +125,46 @@ asic_route_count() {
     echo "${c:-0}"
 }
 
+# Prefixes this peer has advertised to us.
+#   >= 0  : session Established -- the value is PfxRcd (0 is valid: nothing
+#           advertised yet, which is exactly the pre-release state)
+#   -1    : no such peer, session not Established, or vtysh gave no JSON
 pfx_rcd() {
     local n
-    n="$(vtysh $VTYSH_ARG -c "show bgp ipv4 unicast summary json" 2>/dev/null | python3 -c '
+    n="$($VTYSH_CMD -c "show bgp ipv4 unicast summary json" 2>/dev/null | python3 -c '
 import json, sys
+target = sys.argv[1]
 try:
     d = json.load(sys.stdin)
 except Exception:
     print(-1); raise SystemExit
-peers = d.get("peers") or d.get("ipv4Unicast", {}).get("peers", {})
-p = peers.get(sys.argv[1], {})
-print(p.get("pfxRcd", p.get("prefixReceivedCount", -1)))
+
+def find_peer(obj):
+    # The peer may sit under the top level, under "ipv4Unicast", or under a
+    # "vrfs"/"default" wrapper depending on FRR version -- search for whichever
+    # "peers" dict actually contains the target.
+    if isinstance(obj, dict):
+        peers = obj.get("peers")
+        if isinstance(peers, dict) and target in peers:
+            return peers[target]
+        for v in obj.values():
+            r = find_peer(v)
+            if r is not None:
+                return r
+    return None
+
+p = find_peer(d)
+if not isinstance(p, dict):
+    print(-1); raise SystemExit
+state = p.get("state", "")
+pfx = p.get("pfxRcd", p.get("prefixReceivedCount"))
+# Not established -> not a usable session, regardless of any stale pfx field.
+if state and state != "Established":
+    print(-1)
+elif pfx is None:
+    print(-1)
+else:
+    print(pfx)
 ' "$PEER_IP" 2>/dev/null)"
     case "$n" in
         ''|*[!0-9-]*) echo -1;;

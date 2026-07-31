@@ -37,7 +37,7 @@ DUT_IP=""
 ASN=""
 COUNT=30000
 BASE="10.0.0.0"
-VTYSH="vtysh"          # some images ship a wrapper instead, e.g. --vtysh frr-vtysh
+VTYSH=""               # empty = auto-detect frr-vtysh / vtysh (--vtysh to override)
 CHUNK=5000             # statics per vtysh transaction during preload
 SKIP_VERIFY=0
 PL="PL_PERF_BURST"
@@ -64,6 +64,17 @@ case "$ACTION" in
 esac
 [ -n "$DUT_IP" ] || { echo "ERROR: --dut-ip <DUT's BGP session address> required" >&2; exit 1; }
 [ -n "$ASN" ] || { echo "ERROR: --asn <this peer's local AS> required" >&2; exit 1; }
+
+# A SONiC peer ships 'frr-vtysh' (execs into the bgp container), not 'vtysh';
+# calling the wrong one silently does nothing here. Auto-detect unless overridden.
+if [ -z "$VTYSH" ]; then
+    if command -v frr-vtysh >/dev/null 2>&1; then
+        VTYSH="frr-vtysh"
+    else
+        VTYSH="vtysh"
+    fi
+fi
+echo "vtysh command: $VTYSH" >&2
 
 vt() { $VTYSH "$@"; }
 vtc() {  # vtc <cmd>... -- run config commands in one vtysh invocation
