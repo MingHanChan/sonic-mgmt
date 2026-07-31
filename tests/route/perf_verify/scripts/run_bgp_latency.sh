@@ -131,41 +131,8 @@ asic_route_count() {
 #   -1    : no such peer, session not Established, or vtysh gave no JSON
 pfx_rcd() {
     local n
-    n="$($VTYSH_CMD -c "show bgp ipv4 unicast summary json" 2>/dev/null | python3 -c '
-import json, sys
-target = sys.argv[1]
-try:
-    d = json.load(sys.stdin)
-except Exception:
-    print(-1); raise SystemExit
-
-def find_peer(obj):
-    # The peer may sit under the top level, under "ipv4Unicast", or under a
-    # "vrfs"/"default" wrapper depending on FRR version -- search for whichever
-    # "peers" dict actually contains the target.
-    if isinstance(obj, dict):
-        peers = obj.get("peers")
-        if isinstance(peers, dict) and target in peers:
-            return peers[target]
-        for v in obj.values():
-            r = find_peer(v)
-            if r is not None:
-                return r
-    return None
-
-p = find_peer(d)
-if not isinstance(p, dict):
-    print(-1); raise SystemExit
-state = p.get("state", "")
-pfx = p.get("pfxRcd", p.get("prefixReceivedCount"))
-# Not established -> not a usable session, regardless of any stale pfx field.
-if state and state != "Established":
-    print(-1)
-elif pfx is None:
-    print(-1)
-else:
-    print(pfx)
-' "$PEER_IP" 2>/dev/null)"
+    n="$(python3 "$HERE/bgp_peer_pfx.py" --peer-ip "$PEER_IP" \
+         ${NETNS:+--netns "$NETNS"} ${VTYSH:+--vtysh "$VTYSH"} 2>/dev/null)"
     case "$n" in
         ''|*[!0-9-]*) echo -1;;
         *) echo "$n";;
@@ -187,27 +154,22 @@ require_helper() {  # require_helper <script> <flag-it-must-support>
 echo "=== preflight ==="
 require_helper bgp_latency_report.py --tcpdump
 require_helper measure_route_time.py --op
+require_helper bgp_peer_pfx.py --peer-ip
 [ -z "$STATS" ] || require_helper sample_proc_cpu.py --out
+[ -x "$HERE/check_clock_skew.sh" ] || {
+    echo "ERROR: $HERE/check_clock_skew.sh is missing or not executable --" >&2
+    echo "copy the WHOLE scripts/ dir to this DUT." >&2
+    exit 1
+}
 
 # 1) clocks. tcpdump timestamps come from the host kernel; sairedis.rec
 # timestamps are local-time strings written inside the swss container. If the
 # two disagree on the clock OR the timezone every stage number is nonsense --
 # and the failure is silent (a big constant offset just looks like a slow DUT).
-HOST_S="$(date +"%Y-%m-%d %H:%M:%S")"
-CTR_S="$(docker exec "$CONTAINER" date +"%Y-%m-%d %H:%M:%S" 2>/dev/null || echo "")"
-if [ -z "$CTR_S" ]; then
-    echo "ERROR: cannot run 'date' in the $CONTAINER container." >&2
-    exit 1
-fi
-SKEW=$(( $(date -d "$CTR_S" +%s) - $(date -d "$HOST_S" +%s) ))
-echo "clock: host '$HOST_S' vs $CONTAINER '$CTR_S' -> skew ${SKEW}s"
-if [ "${SKEW#-}" -gt 2 ]; then
-    echo "ERROR: the $CONTAINER container's wall clock/timezone is ${SKEW}s away from the" >&2
-    echo "host's. tcpdump (host) and sairedis.rec (container) timestamps cannot be" >&2
-    echo "compared across that gap. Align the container timezone with the host's" >&2
-    echo "(/etc/localtime, /etc/timezone) and re-run." >&2
-    exit 1
-fi
+# Here the stakes are higher than for the other orchestrators: T0 comes from
+# tcpdump (host kernel) and T1 from sairedis.rec (written in the container), so
+# a skew does not just mis-scope the window, it offsets the headline latency.
+"$HERE/check_clock_skew.sh" "$CONTAINER"
 
 # 2) route-ZMQ flag: not a gate here (this test works on both paths), but the
 # result must be labelled with it or the two pipelines get compared by accident.

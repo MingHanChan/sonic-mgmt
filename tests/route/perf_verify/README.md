@@ -60,6 +60,8 @@ tests/route/perf_verify/
     ├── run_t2_bgp.sh             # BGP-feed orchestrator (T1b: zmq off / T2: zmq on): mark, trigger peer, idle-wait, add+del T
     ├── gen_frr_routes.py         # generate FRR/vtysh static-route add/del batch for the BGP peer
     ├── measure_route_time.py     # parse sairedis.rec -> T (count, ms, rate; --op create|remove)
+    ├── check_clock_skew.sh       # preflight: host vs swss-container clock/timezone must agree
+    ├── bgp_peer_pfx.py           # PfxRcd for a peer (-1 if no usable session); frr-vtysh/vtysh aware
     ├── sample_proc_cpu.py        # /proc CPU sampler + env snapshot + bottleneck summary (--stats integration)
     ├── hw_route_watch.sh         # Broadcom cross-check: ASIC_DB vs bcmcmd completion lag
     ├── profile_orchagent.sh      # perf profile of orchagent to validate change #2
@@ -410,8 +412,40 @@ numbers, verify on the treatment image with ZMQ on:
 - orchagent RSS before/after (both changes trade memory for speed):
   `grep VmRSS /proc/$(pidof orchagent)/status`.
 
+## What the orchestrators check before they measure
+
+Each of these produces a *plausible but wrong* number if it is not caught, so
+the orchestrators refuse to run rather than report one:
+
+- **Host vs swss-container clock and timezone** (`check_clock_skew.sh`). The
+  `--since` markers come from the host's `date`; sairedis.rec holds local-time
+  strings written inside the container. Host ahead of the container drops every
+  record ("No route create ops found"); host *behind* it silently folds in
+  earlier runs and inflates T. Aborts beyond ±2 s.
+- **Route-table headroom**, from CRM's own `ipv4_route` accounting where
+  available. Overshooting the ASIC ceiling is silent: the count just stops
+  advancing partway.
+- **PfxRcd on the BGP rows** (`bgp_peer_pfx.py`). A short ASIC delta cannot on
+  its own distinguish "orchagent was slow" from "the routes never arrived" — an
+  inbound route-map, a `maximum-prefix` teardown or a peer that stalled all look
+  identical from ASIC_DB. `run_t2_bgp.sh` reads PfxRcd before and after and says
+  which one it was. It derives the peer address from `--peer`; pass `--peer-ip`
+  when the BGP session address differs from the ssh target.
+- **Helper vintage** — mixing an old copy of one script with a new orchestrator
+  fails mid-run, or worse, measures the wrong thing. Copy the whole `scripts/`
+  dir.
+
 ## Gotchas
 
+- **Timers are wall-clock seconds.** `--stable`, `--timeout` and `--ceiling` are
+  measured against `date(1)`, not loop iterations. They used to count
+  iterations, and since every iteration also paid for a route count, `--stable 5`
+  really meant 10-15 s and `--ceiling 3600` meant 1.5-3 hours.
+- **Route counting goes through EVAL, not `KEYS | wc -l`.** Redis is
+  single-threaded and shares the instance orchagent writes routes through, so
+  shipping ~30k key names back to the client once a second inflated the very T
+  being measured — and contaminated the `redis-server` CPU signature that the
+  T1b/T2 comparison is read from. Keep any new polling you add on `EVAL` too.
 - **Warm-up**: the orchestrators discard iteration 1. Keep it.
 - **Never stage a file into the swss container with `docker cp`.** SONiC starts
   its containers with `--tmpfs /tmp` (`docker_image_ctl.j2`,

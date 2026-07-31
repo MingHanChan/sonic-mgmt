@@ -46,7 +46,16 @@ while [ $# -gt 0 ]; do
 done
 [ "$EXPECT" -gt 0 ] || { echo "ERROR: --expect <route-delta> required" >&2; exit 1; }
 
-asic_count() { sonic-db-cli ASIC_DB keys "ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY:*" 2>/dev/null | wc -l; }
+# Server-side EVAL rather than 'keys | wc -l': this watcher polls in parallel
+# with the injection it is timing, so shipping ~30k key names back on every
+# sample would add load to the redis instance orchagent is writing through.
+asic_count() {
+    local c
+    c="$(sonic-db-cli ASIC_DB eval \
+         "return #redis.call('keys', 'ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY:*')" 0 \
+         2>/dev/null | tr -dc '0-9')"
+    echo "${c:-0}"
+}
 hw_count()   { eval "$COUNT_CMD" 2>/dev/null | grep -Ec "$COUNT_REGEX" || true; }
 
 # preflight: the HW command must work here (Broadcom only, may need sudo)

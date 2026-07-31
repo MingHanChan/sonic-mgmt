@@ -75,9 +75,25 @@ require_helper() {  # require_helper <script> <flag-it-must-support>
 require_helper inject_routes.py --via
 require_helper measure_route_time.py --op
 [ -z "$STATS" ] || require_helper sample_proc_cpu.py --out
+[ -x "$HERE/check_clock_skew.sh" ] || {
+    echo "ERROR: $HERE/check_clock_skew.sh is missing or not executable --" >&2
+    echo "copy the WHOLE scripts/ dir to this DUT." >&2
+    exit 1
+}
 
 asic_route_count() {
-    sonic-db-cli ASIC_DB keys "ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY:*" 2>/dev/null | wc -l
+    # Server-side EVAL, not 'keys | wc -l'. Either way redis scans the whole
+    # ASIC_DB keyspace, but piping ~30k key names back to the client once a
+    # second adds megabytes of traffic to the single-threaded instance that
+    # orchagent is writing routes through -- so the poller inflates the very T
+    # it is measuring, and contaminates the redis-server CPU signature the
+    # --stats summary asks you to read. Same call sonic-mgmt's
+    # asic.count_routes() uses (tests/common/devices/sonic_asic.py).
+    local c
+    c="$(sonic-db-cli ASIC_DB eval \
+         "return #redis.call('keys', 'ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY:*')" 0 \
+         2>/dev/null | tr -dc '0-9')"
+    echo "${c:-0}"
 }
 
 # --- preflight: this benchmark feeds APPL_DB, which orchagent does NOT read
@@ -91,6 +107,12 @@ if [ "$ZMQ_FLAG" = "true" ] && [ "$FORCE" -ne 1 ]; then
     echo "Use run_t2_bgp.sh for the ZMQ path, or --force to override." >&2
     exit 1
 fi
+# --- preflight: T is read from sairedis.rec, whose timestamps are written
+# inside the swss container, but the --since marker below comes from the host's
+# `date`. A clock or timezone mismatch either drops every record (no timing) or
+# silently folds in earlier runs (a plausible but wrong T).
+"$HERE/check_clock_skew.sh" "$CONTAINER"
+
 if counterpoll show 2>/dev/null | grep -qi enable; then
     echo "NOTE: some flex counters are enabled (counterpoll show) -- they add"
     echo "      orchagent/syncd CPU noise; consider disabling them for the run."
@@ -130,14 +152,20 @@ if [ -n "$STATS" ]; then
 fi
 
 wait_for() {  # wait_for <target-count> <cmp: ge|le>
-    local target="$1" cmp="$2" waited=0
+    # --timeout is WALL-CLOCK seconds. It used to count loop iterations, which
+    # at 30k routes was 2-3x longer than it looked: every iteration also paid
+    # for a route count (python startup + a full keyspace scan + shipping the
+    # key names back), so "--timeout 300" was really 10+ minutes.
+    local target="$1" cmp="$2" start c now
+    start=$(date +%s)
     while :; do
-        local c; c="$(asic_route_count)"
+        c="$(asic_route_count)"
         if [ "$cmp" = "ge" ] && [ "$c" -ge "$target" ]; then return 0; fi
         if [ "$cmp" = "le" ] && [ "$c" -le "$target" ]; then return 0; fi
-        sleep 1; waited=$((waited+1))
-        if [ "$waited" -ge "$TIMEOUT" ]; then
-            echo "  TIMEOUT waiting for ASIC route count $cmp $target (now $c)" >&2
+        sleep 1
+        now=$(date +%s)
+        if [ "$((now - start))" -ge "$TIMEOUT" ]; then
+            echo "  TIMEOUT after $((now - start))s waiting for ASIC route count $cmp $target (now $c)" >&2
             return 1
         fi
     done
