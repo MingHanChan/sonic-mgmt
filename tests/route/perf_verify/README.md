@@ -52,6 +52,8 @@ Use the pytest test for CI/regression; use this for the deployment A/B write-up.
 ```
 tests/route/perf_verify/
 ├── README.md                     # this runbook
+├── docs/
+│   └── bgp_announce_to_asic.md   # test case: BGP announce -> ASIC latency (end-to-end, see below)
 └── scripts/
     ├── run_perf.sh               # Redis-path orchestrator: inject N routes (swssconfig), read add+del T, N iters, mean±std
     ├── inject_routes.py          # APPL_DB ROUTE_TABLE producer (swssconfig default; python/redis fallback)
@@ -60,7 +62,10 @@ tests/route/perf_verify/
     ├── measure_route_time.py     # parse sairedis.rec -> T (count, ms, rate; --op create|remove)
     ├── sample_proc_cpu.py        # /proc CPU sampler + env snapshot + bottleneck summary (--stats integration)
     ├── hw_route_watch.sh         # Broadcom cross-check: ASIC_DB vs bcmcmd completion lag
-    └── profile_orchagent.sh      # perf profile of orchagent to validate change #2
+    ├── profile_orchagent.sh      # perf profile of orchagent to validate change #2
+    ├── prep_bgp_burst.sh         # PEER side: preload N routes behind an outbound deny, release/withdraw as one burst
+    ├── run_bgp_latency.sh        # DUT side: capture + trigger + wait, then the stage-resolved latency report
+    └── bgp_latency_report.py     # tcpdump + sairedis.rec -> T_e2e / T_head / T_program + per-prefix p50/p99
 ```
 
 All scripts run **on the DUT** (they need `sonic-db-cli`, docker access to the
@@ -274,6 +279,45 @@ burst — the `--stats` summary shows both signatures side by side. If instead
 `zebra`/`fpmsyncd` saturate a core while `orchagent` idles, the FEED is the
 bottleneck and the row pair cannot resolve change #3 (speed up the feed or
 grow the batch).
+
+---
+
+## Test case: BGP announce -> ASIC programming latency
+
+Rows T1b/T2 above report `last create - first create`, which is orchagent's
+programming window only. If the question is instead **"the peer dumped N routes
+at us — how long until they were in the ASIC?"**, that window starts too late:
+everything from the wire to orchagent's first SAI call (TCP, bgpd parse and
+bestpath, zebra, fpmsyncd, the APPL_DB/ZMQ hop, orchagent's queue) sits outside
+it, and on a 30k burst that head is seconds.
+
+`docs/bgp_announce_to_asic.md` is a self-contained test case for that question.
+It anchors T0 on the wire (`tcpdump` of the peer's first BGP UPDATE) and T1 at
+the last SAI create for the announced set, so it reports:
+
+```
+T_e2e     = D' - A    announce received -> all routes in ASIC   <- headline
+T_head    = D  - A    receive -> orchagent's first SAI call
+T_program = D' - D    orchagent's SAI programming window        <- what T1b/T2 report
+```
+
+plus a per-prefix p50/p90/p99 and a hard validity gate on how bursty the arrival
+actually was. Both anchors are passive, so unlike a count-polling measurement
+nothing in the metric depends on how fast the harness polls.
+
+```bash
+# on the peer: arm (slow, outside the window)
+./prep_bgp_burst.sh prepare --dut-ip 10.0.0.0 --asn 65100 --count 30000
+
+# on the DUT: capture, release the burst, report
+./run_bgp_latency.sh --peer admin@10.0.0.1 --peer-ip 10.0.0.1 --dut-ip 10.0.0.0 \
+    --peer-asn 65100 --count 30000 --out /tmp/bgpperf --measure-withdraw
+```
+
+> The burst matters. Feeding `ip route` lines into vtysh live announces a
+> *trickle* at the peer's parse rate, and any DUT number measured off it is
+> really a peer measurement — `prep_bgp_burst.sh` exists to separate the two,
+> and the report fails the run when the arrival was not a burst.
 
 ---
 
