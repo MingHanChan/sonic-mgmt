@@ -97,13 +97,18 @@ def load_updates(path, min_len):
 def collect_route_ops(recfile, actions, since):
     """Scan sairedis.rec (+ rotated siblings) for route ops after `since`.
 
-    Returns (first_epoch, last_epoch, n_lines, n_entries, {prefix: epoch}).
-    A prefix keeps its EARLIEST timestamp: a prefix that is later updated
-    (set) or re-created must be scored on when it first reached the ASIC.
+    Returns (first_epoch, last_epoch, n_lines, n_entries, {prefix: epoch},
+    [entries_per_op]).  A prefix keeps its EARLIEST timestamp: a prefix that is
+    later updated (set) or re-created must be scored on when it first reached
+    the ASIC.
+
+    entries_per_op is how many route entries each rec line carried, i.e. the
+    realised SAI bulk size -- see report_bulking() for why that matters.
     """
     first = last = None
     n_lines = n_entries = 0
     when = {}
+    per_op = []
     for path in rec_segments(recfile):
         try:
             opener = open
@@ -129,7 +134,9 @@ def collect_route_ops(recfile, actions, since):
                         first = epoch
                     if last is None or epoch > last:
                         last = epoch
-                    for prefix in DEST_RE.findall(line):
+                    dests = DEST_RE.findall(line)
+                    per_op.append(len(dests))
+                    for prefix in dests:
                         n_entries += 1
                         if prefix not in when or epoch < when[prefix]:
                             when[prefix] = epoch
@@ -139,7 +146,53 @@ def collect_route_ops(recfile, actions, since):
             # genuinely gone. Losing some is visible as a low match count.
             print("note: skipped rec segment %s (%s)" % (path, e.__class__.__name__),
                   file=sys.stderr)
-    return first, last, n_lines, n_entries, when
+    return first, last, n_lines, n_entries, when, per_op
+
+
+# Bulk size below which we call the batching broken. orchagent's route bulker
+# is fed by whatever one consumer pops() call returns, and on the Redis path
+# that is capped by swss-common's 128-entry pop batch -- so a healthy run lands
+# near 128, not at 1. (orchagent's -b 8192 is the ring buffer, a different
+# limit, and does not raise this.)
+POP_BATCH_SIZE = 128
+BULK_WARN_BELOW = 8
+
+
+def report_bulking(per_op, verb):
+    """Realised SAI bulk size, and a hard warning when batching has collapsed.
+
+    Why this deserves its own section: orchagent issues route ops in BULK, and
+    one SAI call per route instead of ~128 multiplies syncd's work, the
+    sairedis.rec volume and the ASIC_DB churn by two orders of magnitude. It is
+    invisible in T -- the window can look fine while the transport underneath
+    has quietly stopped batching -- so it has to be measured, not eyeballed.
+    """
+    if not per_op:
+        return True
+    ops = len(per_op)
+    total = sum(per_op)
+    mean = total / float(ops)
+    ordered = sorted(per_op)
+    print()
+    print("SAI bulking (route entries per SAI op)")
+    print("  ops %d   mean %.1f   median %d   min %d   max %d"
+          % (ops, mean, percentile(ordered, 50), ordered[0], ordered[-1]))
+    if mean >= BULK_WARN_BELOW:
+        print("  [OK]   batching healthy (mean %.1f, pop batch is %d)"
+              % (mean, POP_BATCH_SIZE))
+        return True
+    print("  [WARN] BATCHING COLLAPSED: %.2f entries per SAI op over %d ops."
+          % (mean, ops))
+    print("         orchagent is issuing roughly one SAI %s per route instead of"
+          % verb)
+    print("         ~%d, so syncd, sairedis.rec and ASIC_DB all take ~%dx the"
+          % (POP_BATCH_SIZE, int(POP_BATCH_SIZE / max(mean, 1))))
+    print("         traffic they should. The route bulker can only batch what a")
+    print("         single consumer pops() hands it, so a mean near 1 means the")
+    print("         consumer is being woken once per route -- look at the")
+    print("         producer's message granularity, not at orchagent.")
+    print("         (This does NOT invalidate the latency numbers above.)")
+    return False
 
 
 def expected_prefixes(base, count):
@@ -191,7 +244,7 @@ def main():
 
     since = parse_ts(args.since)
     pkts = load_updates(args.tcpdump, args.min_update_len)
-    first_op, last_op, n_lines, n_entries, when = collect_route_ops(
+    first_op, last_op, n_lines, n_entries, when, per_op = collect_route_ops(
         args.rec, OP_ACTIONS[args.op], since)
 
     verb = "create" if args.op == "create" else "remove"
@@ -258,6 +311,8 @@ def main():
         print("  p50 %.3f s   p90 %.3f s   p99 %.3f s   max %.3f s"
               % (percentile(lat, 50), percentile(lat, 90),
                  percentile(lat, 99), lat[-1]))
+
+    bulking_ok = report_bulking(per_op, verb)
 
     samples = load_samples(args.samples)
     if samples:
@@ -326,6 +381,9 @@ def main():
                 "update_bytes": update_bytes,
                 "sai_rec_lines": n_lines,
                 "sai_route_entries": n_entries,
+                "sai_bulk_mean": (sum(per_op) / float(len(per_op))) if per_op else None,
+                "sai_bulk_max": max(per_op) if per_op else None,
+                "sai_bulking_ok": bulking_ok,
                 "matched_prefixes": len(lat),
                 "a_first_epoch": a_first,
                 "a_last_epoch": a_last,
